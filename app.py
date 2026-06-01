@@ -5,7 +5,7 @@ from datetime import datetime
 app = Flask(__name__)
 
 # ============================================================
-# READ KEYS FROM ENVIRONMENT VARIABLES (SECURE)
+# READ KEYS FROM ENVIRONMENT VARIABLES
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -32,111 +32,119 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 # ============================================================
-# DEEPSEEK ANALYSIS (FORCED TO USE SIGNAL PRICE)
+# PARSE INCOMING DATA (FLEXIBLE)
+# ============================================================
+def parse_incoming_data(request_data, request_json, request_text):
+    """Try multiple ways to parse incoming webhook data"""
+    
+    # Try 1: Already parsed JSON
+    if request_json and isinstance(request_json, dict):
+        print("✅ Data parsed as JSON")
+        return request_json
+    
+    # Try 2: Parse raw text as JSON
+    if request_text:
+        try:
+            parsed = json.loads(request_text)
+            print("✅ Raw text parsed as JSON")
+            return parsed
+        except:
+            pass
+    
+    # Try 3: Look for form data
+    if request_data and isinstance(request_data, dict):
+        print("✅ Data from form")
+        return request_data
+    
+    # Try 4: Extract from request.data
+    if request_data:
+        try:
+            if isinstance(request_data, bytes):
+                decoded = request_data.decode('utf-8')
+                parsed = json.loads(decoded)
+                print("✅ Bytes decoded and parsed")
+                return parsed
+        except:
+            pass
+    
+    # Last resort: Return raw text
+    print("⚠️ Using raw text fallback")
+    return {"raw_message": str(request_text) if request_text else "No data"}
+
+# ============================================================
+# DEEPSEEK ANALYSIS
 # ============================================================
 def deepseek_analysis(symbol, price, timeframe, script_data):
     prompt = f"""You are a trading analyst with web search. CRITICAL: Use ONLY the price provided below.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CURRENT SIGNAL PRICE: {price}
 SYMBOL: {symbol}
 TIMEFRAME: {timeframe}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TRADER'S SCRIPT DATA:
 {json.dumps(script_data, indent=2)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IMPORTANT RULES (MUST FOLLOW):
+IMPORTANT RULES:
 1. Entry price MUST be exactly: {price}
-2. Stop Loss MUST be calculated FROM {price} (not from your memory)
+2. Stop Loss MUST be calculated FROM {price}
 3. Take Profit MUST be calculated FROM {price}
 4. DO NOT use old prices from your training data
-5. For BTC: Current price is {price}, NOT $90,000
-6. For Gold: Current price is {price}
-7. For Forex: Current price is {price}
 
-CALCULATION GUIDELINES:
-- Crypto (BTC, ETH): SL within 2-5% of {price}, TP within 5-10%
-- Gold (XAUUSD): SL within 0.5-1%, TP within 1-2%
-- Forex (EURUSD, GBPJPY, etc.): SL within 0.2-0.5%, TP within 0.5-1%
-
-Based on the script data (pillars, EA score, ADX, auction state), determine direction.
-
-Output EXACTLY this format:
-
+Output EXACTLY:
 DIRECTION: [BULLISH/BEARISH/NEUTRAL]
 CONFIDENCE: [0-100%]
 ENTRY: {price}
 STOP LOSS: [number]
 TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
-REASONING: [2-3 sentences using script data]"""
+REASONING: [short explanation]"""
     
     payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
     headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
     try:
         r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-        result = r.json()['choices'][0]['message']['content']
-        print(f"DeepSeek response for {symbol} at {price}: OK")
-        return result
+        return r.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 # ============================================================
-# CHATGPT ANALYSIS (FORCED TO USE SIGNAL PRICE)
+# CHATGPT ANALYSIS
 # ============================================================
 def chatgpt_analysis(symbol, price, timeframe, script_data):
     prompt = f"""You are a trading analyst. CRITICAL: Use ONLY the price provided below.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CURRENT SIGNAL PRICE: {price}
 SYMBOL: {symbol}
 TIMEFRAME: {timeframe}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TRADER'S SCRIPT DATA:
 {json.dumps(script_data, indent=2)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IMPORTANT RULES (MUST FOLLOW):
+IMPORTANT RULES:
 1. Entry price MUST be exactly: {price}
-2. Stop Loss MUST be calculated FROM {price} (not from your memory)
+2. Stop Loss MUST be calculated FROM {price}
 3. Take Profit MUST be calculated FROM {price}
 4. DO NOT use old prices from your training data
-5. For BTC: Current price is {price}, NOT $90,000
-6. For Gold: Current price is {price}
-7. For Forex: Current price is {price}
 
-CALCULATION GUIDELINES:
-- Crypto (BTC, ETH): SL within 2-5% of {price}, TP within 5-10%
-- Gold (XAUUSD): SL within 0.5-1%, TP within 1-2%
-- Forex (EURUSD, GBPJPY, etc.): SL within 0.2-0.5%, TP within 0.5-1%
-
-Based on the script data (pillars, EA score, ADX, auction state), determine direction.
-
-Output EXACTLY this format:
-
+Output EXACTLY:
 DIRECTION: [BULLISH/BEARISH/NEUTRAL]
 CONFIDENCE: [0-100%]
 ENTRY: {price}
 STOP LOSS: [number]
 TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
-REASONING: [2-3 sentences using script data]"""
+REASONING: [short explanation]"""
     
     payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
     headers = {"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"}
     try:
         r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
-        result = r.json()['choices'][0]['message']['content']
-        print(f"ChatGPT response for {symbol} at {price}: OK")
-        return result
+        return r.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 # ============================================================
-# FINAL CONSENSUS (DeepSeek + ChatGPT agree)
+# FINAL CONSENSUS
 # ============================================================
 def final_consensus(symbol, price, deepseek_result, chatgpt_result):
     prompt = f"""Make FINAL TRADING DECISION.
@@ -144,23 +152,17 @@ def final_consensus(symbol, price, deepseek_result, chatgpt_result):
 Symbol: {symbol}
 Current Price: {price}
 
-DEEPSEEK ANALYSIS:
-{deepseek_result}
+DEEPSEEK: {deepseek_result}
+CHATGPT: {chatgpt_result}
 
-CHATGPT ANALYSIS:
-{chatgpt_result}
-
-Output EXACTLY this format:
-
+Output EXACTLY:
 AGREEMENT: [YES/NO]
-
 IF YES:
 ACTION: [LONG/SHORT]
 ENTRY: [price]
 STOP LOSS: [number]
 TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
-
 IF NO:
 REASON: [why]
 WAIT FOR: [condition]"""
@@ -174,7 +176,7 @@ WAIT FOR: [condition]"""
         return f"ERROR: {str(e)}"
 
 # ============================================================
-# WEBHOOK ENDPOINT (Receives TradingView Alerts)
+# WEBHOOK ENDPOINT
 # ============================================================
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
@@ -182,38 +184,48 @@ def webhook():
         return "Webhook endpoint is working. Send POST requests with trading data.", 200
     
     try:
-        # Get data from TradingView
-        data = request.get_json()
-        if not data and request.data:
-            try:
-                data = json.loads(request.data)
-            except:
-                data = {"raw_message": request.data.decode('utf-8')}
+        # Get data in multiple formats
+        request_json = request.get_json(silent=True)
+        request_data = request.form.to_dict() if request.form else None
+        request_text = request.get_data(as_text=True)
+        
+        print(f"📥 Webhook received. Content-Type: {request.content_type}")
+        print(f"📥 Raw data (first 200 chars): {request_text[:200]}")
+        
+        # Parse the data
+        data = parse_incoming_data(request_data, request_json, request_text)
         
         if not data:
+            send_telegram("❌ No data received from TradingView")
             return "No data received", 400
         
-        # Extract signal data
-        symbol = data.get('symbol', 'Unknown')
-        price = data.get('price', 'Unknown')
-        score = data.get('score', data.get('script_strength', 'Unknown'))
-        timeframe = data.get('timeframe', '1H')
-        direction = data.get('direction', 'Unknown')
+        print(f"📊 Parsed data: {json.dumps(data, indent=2)[:500]}")
         
-        print(f"📥 Signal received: {symbol} at {price} | Score: {score} | Direction: {direction}")
+        # Extract signal data (try multiple field names)
+        symbol = data.get('symbol') or data.get('ticker') or data.get('pair') or 'Unknown'
+        price = data.get('price') or data.get('close') or data.get('current_price') or 'Unknown'
+        score = data.get('score') or data.get('strength') or data.get('script_strength') or data.get('raw_signal') or 'Unknown'
+        timeframe = data.get('timeframe') or data.get('interval') or '1H'
+        direction = data.get('direction') or data.get('signal') or 'Unknown'
+        
+        # Convert price to number if possible
+        try:
+            price = float(price)
+        except:
+            pass
+        
+        print(f"🎯 Signal: {symbol} at {price} | Score: {score}")
         
         # Send initial notification
         send_telegram(f"🎯 *SIGNAL TRIGGERED*\n━━━━━━━━━━━━━━━━━━━━━━\nSymbol: {symbol}\nPrice: {price}\nScore: {score}/100\nDirection: {direction}\nTimeframe: {timeframe}\n\n*Analyzing with AI...*")
         
-        # Get DeepSeek analysis
+        # Get AI analyses
         deepseek = deepseek_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🤖 *DEEPSEEK (with news):*\n{deepseek}")
+        send_telegram(f"🤖 *DEEPSEEK:*\n{deepseek}")
         
-        # Get ChatGPT analysis
         chatgpt = chatgpt_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🧠 *CHATGPT (technical):*\n{chatgpt}")
+        send_telegram(f"🧠 *CHATGPT:*\n{chatgpt}")
         
-        # Get final consensus
         consensus = final_consensus(symbol, price, deepseek, chatgpt)
         send_telegram(f"✅ *FINAL CONSENSUS:*\n{consensus}")
         
@@ -226,21 +238,15 @@ def webhook():
         return error_msg, 500
 
 # ============================================================
-# HEALTH CHECK (For Render)
+# HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
 def health():
     return "OK", 200
 
-# ============================================================
-# ROOT ENDPOINT
-# ============================================================
 @app.route('/', methods=['GET'])
 def root():
     return "Trading Bot is running. Webhook endpoint at /webhook", 200
 
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
