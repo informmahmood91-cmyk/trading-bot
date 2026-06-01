@@ -1,5 +1,5 @@
-import json, requests, os
-from flask import Flask, request
+import json, requests, os, urllib.parse
+from flask import Flask, request, jsonify
 from datetime import datetime
 
 app = Flask(__name__)
@@ -42,8 +42,11 @@ REASONING: [short explanation]"""
     
     payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 1000}
     headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
-    r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-    return r.json()['choices'][0]['message']['content']
+    try:
+        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
+        return r.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
 def chatgpt_analysis(symbol, price, timeframe, script_data):
     prompt = f"""Analyze this trading signal:
@@ -65,8 +68,11 @@ REASONING: [short explanation]"""
     
     payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
     headers = {"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"}
-    r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
-    return r.json()['choices'][0]['message']['content']
+    try:
+        r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
+        return r.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
 def final_consensus(symbol, price, deepseek_result, chatgpt_result):
     prompt = f"""Make FINAL TRADING DECISION.
@@ -90,15 +96,31 @@ WAIT FOR: [condition]"""
     
     payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 600}
     headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
-    r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-    return r.json()['choices'][0]['message']['content']
+    try:
+        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
+        return r.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
+    # Handle GET requests (for testing)
+    if request.method == 'GET':
+        return "Webhook endpoint is working. Send POST requests with trading data.", 200
+    
+    # Handle POST requests (TradingView alerts)
     try:
         data = request.get_json()
+        
+        # If no JSON, try to parse form data or text
+        if not data and request.data:
+            try:
+                data = json.loads(request.data)
+            except:
+                data = {"raw_message": request.data.decode('utf-8')}
+        
         if not data:
-            return "No data", 400
+            return "No data received", 400
         
         symbol = data.get('symbol', 'Unknown')
         price = data.get('price', 'Unknown')
@@ -114,16 +136,17 @@ def webhook():
         send_telegram(f"🧠 CHATGPT:\n{chatgpt}")
         
         consensus = final_consensus(symbol, price, deepseek, chatgpt)
-        send_telegram(f"✅ FINAL DECISION:\n{consensus}")
+        send_telegram(f"✅ FINAL CONSENSUS:\n{consensus}")
         
         return "OK", 200
     except Exception as e:
-        send_telegram(f"❌ ERROR: {str(e)[:200]}")
-        return str(e), 500
+        error_msg = f"ERROR: {str(e)[:200]}"
+        send_telegram(f"❌ {error_msg}")
+        return error_msg, 500
 
-@app.route('/health')
+@app.route('/health', methods=['GET'])
 def health():
-    return "OK"
+    return "OK", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
