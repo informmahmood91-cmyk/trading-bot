@@ -1,20 +1,20 @@
-import json, requests, urllib.parse
+import json, requests
 from flask import Flask, request
 from datetime import datetime
 
 app = Flask(__name__)
 
 # ============================================================
-# ✅ PASTE YOUR KEYS HERE (Get them from Telegram, DeepSeek, ChatGPT)
+# ✅ PASTE YOUR KEYS HERE
 # ============================================================
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID_HERE"
-DEEPSEEK_KEY = "YOUR_DEEPSEEK_API_KEY_HERE"
-CHATGPT_KEY = "YOUR_CHATGPT_API_KEY_HERE"
+TELEGRAM_TOKEN = "8957910002:AAHkqK3TlRum1jCzm2XGRJtJwrXZQO9x7XI"
+TELEGRAM_CHAT_ID = "8736138224"
+DEEPSEEK_KEY = "sk-6d64640d8d6b443bb8cc3beef9961ee3"
+CHATGPT_KEY = "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"
 
 # ============================================================
-# DO NOT CHANGE ANYTHING BELOW THIS LINE
+# DO NOT CHANGE BELOW THIS LINE
 # ============================================================
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -25,128 +25,60 @@ def send_telegram(msg):
     if len(msg) > 4000:
         msg = msg[:4000]
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-        print("✅ Telegram sent")
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        print(f"Telegram response: {r.status_code}")
+        if r.status_code == 200:
+            print("✅ Message sent to Telegram")
+        else:
+            print(f"❌ Telegram error: {r.text}")
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
-
-def deepseek_analysis(symbol, price, timeframe, script_data):
-    prompt = f"""Analyze this trading signal:
-
-TRADER'S SCRIPT (score 80+ triggered):
-{json.dumps(script_data, indent=2)}
-
-Symbol: {symbol} | Price: {price} | Timeframe: {timeframe}
-
-1. SEARCH WEB for news, economic calendar
-2. DO YOUR OWN technical analysis
-3. REVIEW their script (pillars, EA score, validator)
-4. Give DIRECTION and PROPOSED TRADE
-
-Output:
-DIRECTION: [BULLISH/BEARISH/NEUTRAL]
-CONFIDENCE: [0-100%]
-PROPOSED TRADE: Entry X, SL X, TP X
-REASONING: [short explanation]"""
-    
-    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 1000}
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
-    try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-        return r.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"ERROR: {str(e)}"
-
-def chatgpt_analysis(symbol, price, timeframe, script_data):
-    prompt = f"""Analyze this trading signal:
-
-TRADER'S SCRIPT (score 80+ triggered):
-{json.dumps(script_data, indent=2)}
-
-Symbol: {symbol} | Price: {price} | Timeframe: {timeframe}
-
-1. DO YOUR OWN technical analysis
-2. REVIEW their script
-3. Give DIRECTION and PROPOSED TRADE
-
-Output:
-DIRECTION: [BULLISH/BEARISH/NEUTRAL]
-CONFIDENCE: [0-100%]
-PROPOSED TRADE: Entry X, SL X, TP X
-REASONING: [short explanation]"""
-    
-    payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
-    headers = {"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"}
-    try:
-        r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
-        return r.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"ERROR: {str(e)}"
-
-def final_consensus(symbol, price, deepseek_result, chatgpt_result):
-    prompt = f"""Make FINAL TRADING DECISION.
-
-Symbol: {symbol} | Price: {price}
-
-DEEPSEEK: {deepseek_result}
-CHATGPT: {chatgpt_result}
-
-Output EXACTLY:
-AGREEMENT: [YES/NO]
-IF YES:
-ACTION: [LONG/SHORT]
-ENTRY: [price]
-STOP: [price]
-TARGET: [price]
-RR: [1:X]
-IF NO:
-REASON: [why]
-WAIT FOR: [condition]"""
-    
-    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 600}
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
-    try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-        return r.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+        print(f"❌ Telegram exception: {e}")
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
+    # Handle GET request (for testing)
     if request.method == 'GET':
+        send_telegram("✅ Webhook endpoint is working. Send POST requests with trading data.")
         return "Webhook endpoint is working. Send POST requests with trading data.", 200
     
+    # Handle POST request (TradingView alerts)
     try:
+        print("📥 Webhook received!")
+        
+        # Get the data from TradingView
         data = request.get_json()
+        
+        # If no JSON, try to get raw data
         if not data and request.data:
             try:
                 data = json.loads(request.data)
             except:
                 data = {"raw_message": request.data.decode('utf-8')}
         
+        print(f"📊 Data received: {data}")
+        
         if not data:
+            send_telegram("❌ No data received from TradingView")
             return "No data received", 400
         
+        # Extract data
         symbol = data.get('symbol', 'Unknown')
         price = data.get('price', 'Unknown')
         score = data.get('script_strength', 'Unknown')
         timeframe = data.get('timeframe', '1H')
         
-        send_telegram(f"🎯 SIGNAL TRIGGERED\nSymbol: {symbol}\nPrice: {price}\nScore: {score}/100\nTimeframe: {timeframe}\n\nAnalyzing...")
+        # Send initial notification
+        send_telegram(f"🎯 *SIGNAL TRIGGERED*\n━━━━━━━━━━━━━━━━━━━━━━\nSymbol: {symbol}\nPrice: {price}\nScore: {score}/100\nTimeframe: {timeframe}\n\n*Analyzing with AI...*")
         
-        deepseek = deepseek_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🤖 DEEPSEEK:\n{deepseek}")
-        
-        chatgpt = chatgpt_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🧠 CHATGPT:\n{chatgpt}")
-        
-        consensus = final_consensus(symbol, price, deepseek, chatgpt)
-        send_telegram(f"✅ FINAL CONSENSUS:\n{consensus}")
+        # Simple response without DeepSeek/ChatGPT (for testing)
+        send_telegram(f"✅ *Bot is working!*\n\nYour TradingView alert reached the bot successfully.\n\nSymbol: {symbol}\nPrice: {price}\n\n*Next step:* Add $5 to DeepSeek and ChatGPT for real AI analysis.")
         
         return "OK", 200
+        
     except Exception as e:
-        error_msg = f"ERROR: {str(e)[:200]}"
-        send_telegram(f"❌ {error_msg}")
+        error_msg = f"❌ Error: {str(e)[:200]}"
+        print(error_msg)
+        send_telegram(error_msg)
         return error_msg, 500
 
 @app.route('/health', methods=['GET'])
