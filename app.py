@@ -6,24 +6,15 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# ============================================================
-# READ KEYS FROM ENVIRONMENT VARIABLES
-# ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
 CHATGPT_KEY = os.environ.get("CHATGPT_KEY")
 
-# ============================================================
-# API ENDPOINTS
-# ============================================================
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 CHATGPT_URL = "https://api.openai.com/v1/chat/completions"
 
 
-# ============================================================
-# TELEGRAM SENDER
-# ============================================================
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     if len(msg) > 4000:
@@ -39,70 +30,45 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 
-# ============================================================
-# PARSE INCOMING DATA (FLEXIBLE)
-# ============================================================
 def parse_incoming_data(request_form, request_json, request_text):
-    """Try multiple ways to parse incoming webhook data."""
-
     if request_json and isinstance(request_json, dict):
-        print("✅ Data parsed as JSON")
+        print("Data parsed as JSON")
         return request_json
-
     if request_text:
         try:
             parsed = json.loads(request_text)
-            print("✅ Raw text parsed as JSON")
+            print("Raw text parsed as JSON")
             return parsed
         except Exception:
             pass
-
     if request_form and isinstance(request_form, dict):
-        print("✅ Data from form")
+        print("Data from form")
         return request_form
-
-    if request_form:
-        try:
-            if isinstance(request_form, bytes):
-                decoded = request_form.decode("utf-8")
-                parsed = json.loads(decoded)
-                print("✅ Bytes decoded and parsed")
-                return parsed
-        except Exception:
-            pass
-
-    print("⚠️ Using raw text fallback")
+    print("Using raw text fallback")
     return {"raw_message": str(request_text) if request_text else "No data"}
 
 
-# ============================================================
-# DEEPSEEK ANALYSIS
-# ============================================================
 def deepseek_analysis(symbol, price, timeframe, script_data):
-    prompt = f"""You are a trading analyst. CRITICAL: Use ONLY the price provided below.
-
-CURRENT SIGNAL PRICE: {price}
-SYMBOL: {symbol}
-TIMEFRAME: {timeframe}
-
-TRADER'S SCRIPT DATA:
-{json.dumps(script_data, indent=2)}
-
-IMPORTANT RULES:
-1. Entry price MUST be exactly: {price}
-2. Stop Loss MUST be calculated FROM {price}
-3. Take Profit MUST be calculated FROM {price}
-4. DO NOT use old prices from your training data
-
-Output EXACTLY:
-DIRECTION: [BULLISH/BEARISH/NEUTRAL]
-CONFIDENCE: [0-100%]
-ENTRY: {price}
-STOP LOSS: [number]
-TAKE PROFIT: [number]
-RISK:REWARD: [1:X]
-REASONING: [short explanation]"""
-
+    prompt = (
+        f"You are a trading analyst. CRITICAL: Use ONLY the price provided below.\n\n"
+        f"CURRENT SIGNAL PRICE: {price}\n"
+        f"SYMBOL: {symbol}\n"
+        f"TIMEFRAME: {timeframe}\n\n"
+        f"TRADER'S SCRIPT DATA:\n{json.dumps(script_data, indent=2)}\n\n"
+        f"IMPORTANT RULES:\n"
+        f"1. Entry price MUST be exactly: {price}\n"
+        f"2. Stop Loss MUST be calculated FROM {price}\n"
+        f"3. Take Profit MUST be calculated FROM {price}\n"
+        f"4. DO NOT use old prices from your training data\n\n"
+        f"Output EXACTLY:\n"
+        f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
+        f"CONFIDENCE: [0-100%]\n"
+        f"ENTRY: {price}\n"
+        f"STOP LOSS: [number]\n"
+        f"TAKE PROFIT: [number]\n"
+        f"RISK:REWARD: [1:X]\n"
+        f"REASONING: [short explanation]"
+    )
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
@@ -118,37 +84,30 @@ REASONING: [short explanation]"""
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"ERROR: {str(e)}"
+        return f"DEEPSEEK ERROR: {str(e)}"
 
 
-# ============================================================
-# CHATGPT ANALYSIS
-# ============================================================
 def chatgpt_analysis(symbol, price, timeframe, script_data):
-    prompt = f"""You are a trading analyst. CRITICAL: Use ONLY the price provided below.
-
-CURRENT SIGNAL PRICE: {price}
-SYMBOL: {symbol}
-TIMEFRAME: {timeframe}
-
-TRADER'S SCRIPT DATA:
-{json.dumps(script_data, indent=2)}
-
-IMPORTANT RULES:
-1. Entry price MUST be exactly: {price}
-2. Stop Loss MUST be calculated FROM {price}
-3. Take Profit MUST be calculated FROM {price}
-4. DO NOT use old prices from your training data
-
-Output EXACTLY:
-DIRECTION: [BULLISH/BEARISH/NEUTRAL]
-CONFIDENCE: [0-100%]
-ENTRY: {price}
-STOP LOSS: [number]
-TAKE PROFIT: [number]
-RISK:REWARD: [1:X]
-REASONING: [short explanation]"""
-
+    prompt = (
+        f"You are a trading analyst. CRITICAL: Use ONLY the price provided below.\n\n"
+        f"CURRENT SIGNAL PRICE: {price}\n"
+        f"SYMBOL: {symbol}\n"
+        f"TIMEFRAME: {timeframe}\n\n"
+        f"TRADER'S SCRIPT DATA:\n{json.dumps(script_data, indent=2)}\n\n"
+        f"IMPORTANT RULES:\n"
+        f"1. Entry price MUST be exactly: {price}\n"
+        f"2. Stop Loss MUST be calculated FROM {price}\n"
+        f"3. Take Profit MUST be calculated FROM {price}\n"
+        f"4. DO NOT use old prices from your training data\n\n"
+        f"Output EXACTLY:\n"
+        f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
+        f"CONFIDENCE: [0-100%]\n"
+        f"ENTRY: {price}\n"
+        f"STOP LOSS: [number]\n"
+        f"TAKE PROFIT: [number]\n"
+        f"RISK:REWARD: [1:X]\n"
+        f"REASONING: [short explanation]"
+    )
     payload = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
@@ -164,33 +123,28 @@ REASONING: [short explanation]"""
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"ERROR: {str(e)}"
+        return f"CHATGPT ERROR: {str(e)}"
 
 
-# ============================================================
-# FINAL CONSENSUS
-# ============================================================
 def final_consensus(symbol, price, deepseek_result, chatgpt_result):
-    prompt = f"""Make FINAL TRADING DECISION.
-
-Symbol: {symbol}
-Current Price: {price}
-
-DEEPSEEK: {deepseek_result}
-CHATGPT: {chatgpt_result}
-
-Output EXACTLY:
-AGREEMENT: [YES/NO]
-IF YES:
-ACTION: [LONG/SHORT]
-ENTRY: [price]
-STOP LOSS: [number]
-TAKE PROFIT: [number]
-RISK:REWARD: [1:X]
-IF NO:
-REASON: [why]
-WAIT FOR: [condition]"""
-
+    prompt = (
+        f"Make FINAL TRADING DECISION.\n\n"
+        f"Symbol: {symbol}\n"
+        f"Current Price: {price}\n\n"
+        f"DEEPSEEK: {deepseek_result}\n\n"
+        f"CHATGPT: {chatgpt_result}\n\n"
+        f"Output EXACTLY:\n"
+        f"AGREEMENT: [YES/NO]\n"
+        f"IF YES:\n"
+        f"ACTION: [LONG/SHORT]\n"
+        f"ENTRY: [price]\n"
+        f"STOP LOSS: [number]\n"
+        f"TAKE PROFIT: [number]\n"
+        f"RISK:REWARD: [1:X]\n"
+        f"IF NO:\n"
+        f"REASON: [why]\n"
+        f"WAIT FOR: [condition]"
+    )
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
@@ -206,32 +160,27 @@ WAIT FOR: [condition]"""
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"ERROR: {str(e)}"
+        return f"CONSENSUS ERROR: {str(e)}"
 
 
-# ============================================================
-# WEBHOOK ENDPOINT
-# ============================================================
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "Webhook endpoint is working. Send POST requests with trading data.", 200
+        return "Webhook working. Send POST requests with trading data.", 200
 
     try:
         request_json = request.get_json(silent=True)
         request_form = request.form.to_dict() if request.form else None
         request_text = request.get_data(as_text=True)
 
-        print(f"📥 Webhook received. Content-Type: {request.content_type}")
-        print(f"📥 Raw data (first 200 chars): {request_text[:200]}")
+        print(f"Webhook received. Content-Type: {request.content_type}")
+        print(f"Raw data (first 200 chars): {request_text[:200]}")
 
         data = parse_incoming_data(request_form, request_json, request_text)
 
         if not data:
-            send_telegram("❌ No data received from TradingView")
+            send_telegram("No data received from TradingView")
             return "No data received", 400
-
-        print(f"📊 Parsed data: {json.dumps(data, indent=2)[:500]}")
 
         symbol = data.get("symbol") or data.get("ticker") or data.get("pair") or "Unknown"
         raw_price = data.get("price") or data.get("close") or data.get("current_price") or "Unknown"
@@ -244,11 +193,10 @@ def webhook():
         except (TypeError, ValueError):
             price = raw_price
 
-        print(f"🎯 Signal: {symbol} at {price} | Score: {score}")
+        print(f"Signal: {symbol} at {price} | Score: {score}")
 
         send_telegram(
-            f"🎯 *SIGNAL TRIGGERED*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*SIGNAL TRIGGERED*\n"
             f"Symbol: {symbol}\n"
             f"Price: {price}\n"
             f"Score: {score}/100\n"
@@ -258,9 +206,33 @@ def webhook():
         )
 
         deepseek = deepseek_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🤖 *DEEPSEEK:*\n{deepseek}")
+        send_telegram(f"*DEEPSEEK:*\n{deepseek}")
 
         chatgpt = chatgpt_analysis(symbol, price, timeframe, data)
-        send_telegram(f"🧠 *CHATGPT:*\n{chatgpt}")
+        send_telegram(f"*CHATGPT:*\n{chatgpt}")
 
         consensus = final_consensus(symbol, price, deepseek, chatgpt)
+        send_telegram(f"*FINAL CONSENSUS:*\n{consensus}")
+
+        return "OK", 200
+
+    except Exception as e:
+        error_msg = f"ERROR: {str(e)[:200]}"
+        print(f"{error_msg}")
+        send_telegram(f"*System Error:*\n{error_msg}")
+        return error_msg, 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return "Trading Bot is running. Webhook at /webhook", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
