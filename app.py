@@ -50,30 +50,54 @@ def parse_incoming_data(request_form, request_json, request_text):
 
 def deepseek_analysis(symbol, price, timeframe, script_data):
     prompt = (
-        f"You are a trading analyst. CRITICAL: Use ONLY the price provided below.\n\n"
-        f"CURRENT SIGNAL PRICE: {price}\n"
+        f"You are a professional trading analyst with access to live news and fundamentals.\n\n"
+        f"SIGNAL DATA FROM TRADINGVIEW:\n"
         f"SYMBOL: {symbol}\n"
-        f"TIMEFRAME: {timeframe}\n\n"
-        f"TRADER'S SCRIPT DATA:\n{json.dumps(script_data, indent=2)}\n\n"
-        f"IMPORTANT RULES:\n"
-        f"1. Entry price MUST be exactly: {price}\n"
-        f"2. Stop Loss MUST be calculated FROM {price}\n"
-        f"3. Take Profit MUST be calculated FROM {price}\n"
-        f"4. DO NOT use old prices from your training data\n\n"
-        f"Output EXACTLY:\n"
+        f"CURRENT PRICE: {price}\n"
+        f"TIMEFRAME: {timeframe}\n"
+        f"DIRECTION: {script_data.get('direction', 'N/A')}\n"
+        f"SIGNAL SCORE: {script_data.get('score', 'N/A')}/100\n"
+        f"ADX TREND STRENGTH: {script_data.get('adx', 'N/A')}\n"
+        f"MARKET STRUCTURE: {script_data.get('structure', 'N/A')}\n"
+        f"SESSION: {script_data.get('session', 'N/A')}\n"
+        f"VWAP PILLAR: {script_data.get('pillar_vwap', 'N/A')}\n"
+        f"PIVOT PILLAR: {script_data.get('pillar_pivot', 'N/A')}\n"
+        f"EMA PILLAR: {script_data.get('pillar_ema', 'N/A')}\n"
+        f"HHHL PILLAR: {script_data.get('pillar_hhhl', 'N/A')}\n"
+        f"AUCTION PILLAR: {script_data.get('pillar_auction', 'N/A')}\n"
+        f"EA SCORE: {script_data.get('ea_score', 'N/A')}\n"
+        f"EA GATE: {script_data.get('ea_gate', 'N/A')}\n"
+        f"VALIDATOR STATUS: {script_data.get('validator_status', 'N/A')}\n"
+        f"VALIDATOR CONFIDENCE: {script_data.get('validator_confidence', 'N/A')}\n"
+        f"VALIDATOR T1 RATE: {script_data.get('validator_t1_rate', 'N/A')}\n"
+        f"VWAP VALUE: {script_data.get('vwap', 'N/A')}\n"
+        f"PIVOT VALUE: {script_data.get('pivot', 'N/A')}\n\n"
+        f"YOUR TASKS:\n"
+        f"1. Consider recent NEWS and FUNDAMENTALS for {symbol}\n"
+        f"2. Consider current market sentiment\n"
+        f"3. Validate the technical signal above\n"
+        f"4. Calculate SL and TP based STRICTLY on price {price}\n\n"
+        f"STRICT RULES:\n"
+        f"- ENTRY must be exactly: {price}\n"
+        f"- STOP LOSS must be calculated from {price}\n"
+        f"- TAKE PROFIT must be calculated from {price}\n"
+        f"- Never write Unknown for entry, always use: {price}\n\n"
+        f"Output EXACTLY in this format:\n"
         f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
         f"CONFIDENCE: [0-100%]\n"
         f"ENTRY: {price}\n"
-        f"STOP LOSS: [number]\n"
-        f"TAKE PROFIT: [number]\n"
+        f"STOP LOSS: [number only]\n"
+        f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
-        f"REASONING: [short explanation]"
+        f"NEWS SENTIMENT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
+        f"FUNDAMENTAL BIAS: [BULLISH/BEARISH/NEUTRAL]\n"
+        f"REASONING: [technical + news + fundamental explanation]"
     )
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 800,
+        "max_tokens": 1000,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_KEY}",
@@ -89,30 +113,54 @@ def deepseek_analysis(symbol, price, timeframe, script_data):
 
 def chatgpt_analysis(symbol, price, timeframe, script_data):
     prompt = (
-        f"You are a trading analyst. CRITICAL: Use ONLY the price provided below.\n\n"
-        f"CURRENT SIGNAL PRICE: {price}\n"
+        f"You are a professional trading analyst with access to live news and fundamentals.\n\n"
+        f"SIGNAL DATA FROM TRADINGVIEW:\n"
         f"SYMBOL: {symbol}\n"
-        f"TIMEFRAME: {timeframe}\n\n"
-        f"TRADER'S SCRIPT DATA:\n{json.dumps(script_data, indent=2)}\n\n"
-        f"IMPORTANT RULES:\n"
-        f"1. Entry price MUST be exactly: {price}\n"
-        f"2. Stop Loss MUST be calculated FROM {price}\n"
-        f"3. Take Profit MUST be calculated FROM {price}\n"
-        f"4. DO NOT use old prices from your training data\n\n"
-        f"Output EXACTLY:\n"
+        f"CURRENT PRICE: {price}\n"
+        f"TIMEFRAME: {timeframe}\n"
+        f"DIRECTION: {script_data.get('direction', 'N/A')}\n"
+        f"SIGNAL SCORE: {script_data.get('score', 'N/A')}/100\n"
+        f"ADX TREND STRENGTH: {script_data.get('adx', 'N/A')}\n"
+        f"MARKET STRUCTURE: {script_data.get('structure', 'N/A')}\n"
+        f"SESSION: {script_data.get('session', 'N/A')}\n"
+        f"VWAP PILLAR: {script_data.get('pillar_vwap', 'N/A')}\n"
+        f"PIVOT PILLAR: {script_data.get('pillar_pivot', 'N/A')}\n"
+        f"EMA PILLAR: {script_data.get('pillar_ema', 'N/A')}\n"
+        f"HHHL PILLAR: {script_data.get('pillar_hhhl', 'N/A')}\n"
+        f"AUCTION PILLAR: {script_data.get('pillar_auction', 'N/A')}\n"
+        f"EA SCORE: {script_data.get('ea_score', 'N/A')}\n"
+        f"EA GATE: {script_data.get('ea_gate', 'N/A')}\n"
+        f"VALIDATOR STATUS: {script_data.get('validator_status', 'N/A')}\n"
+        f"VALIDATOR CONFIDENCE: {script_data.get('validator_confidence', 'N/A')}\n"
+        f"VALIDATOR T1 RATE: {script_data.get('validator_t1_rate', 'N/A')}\n"
+        f"VWAP VALUE: {script_data.get('vwap', 'N/A')}\n"
+        f"PIVOT VALUE: {script_data.get('pivot', 'N/A')}\n\n"
+        f"YOUR TASKS:\n"
+        f"1. Consider recent NEWS and FUNDAMENTALS for {symbol}\n"
+        f"2. Consider current market sentiment\n"
+        f"3. Validate the technical signal above\n"
+        f"4. Calculate SL and TP based STRICTLY on price {price}\n\n"
+        f"STRICT RULES:\n"
+        f"- ENTRY must be exactly: {price}\n"
+        f"- STOP LOSS must be calculated from {price}\n"
+        f"- TAKE PROFIT must be calculated from {price}\n"
+        f"- Never write Unknown for entry, always use: {price}\n\n"
+        f"Output EXACTLY in this format:\n"
         f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
         f"CONFIDENCE: [0-100%]\n"
         f"ENTRY: {price}\n"
-        f"STOP LOSS: [number]\n"
-        f"TAKE PROFIT: [number]\n"
+        f"STOP LOSS: [number only]\n"
+        f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
-        f"REASONING: [short explanation]"
+        f"NEWS SENTIMENT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
+        f"FUNDAMENTAL BIAS: [BULLISH/BEARISH/NEUTRAL]\n"
+        f"REASONING: [technical + news + fundamental explanation]"
     )
     payload = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 800,
+        "max_tokens": 1000,
     }
     headers = {
         "Authorization": f"Bearer {CHATGPT_KEY}",
@@ -128,28 +176,33 @@ def chatgpt_analysis(symbol, price, timeframe, script_data):
 
 def final_consensus(symbol, price, deepseek_result, chatgpt_result):
     prompt = (
-        f"Make FINAL TRADING DECISION.\n\n"
-        f"Symbol: {symbol}\n"
-        f"Current Price: {price}\n\n"
-        f"DEEPSEEK: {deepseek_result}\n\n"
-        f"CHATGPT: {chatgpt_result}\n\n"
-        f"Output EXACTLY:\n"
+        f"You are the final decision maker. Two AI analysts have reviewed a trade.\n\n"
+        f"SYMBOL: {symbol}\n"
+        f"CURRENT PRICE: {price}\n\n"
+        f"DEEPSEEK ANALYSIS:\n{deepseek_result}\n\n"
+        f"CHATGPT ANALYSIS:\n{chatgpt_result}\n\n"
+        f"YOUR TASKS:\n"
+        f"1. Compare both analyses\n"
+        f"2. Check if they agree on direction\n"
+        f"3. Give final verdict with best SL and TP\n\n"
+        f"STRICT RULES:\n"
+        f"- ENTRY must be exactly: {price}\n"
+        f"- Never write Unknown\n\n"
+        f"Output EXACTLY in this format:\n"
         f"AGREEMENT: [YES/NO]\n"
-        f"IF YES:\n"
-        f"ACTION: [LONG/SHORT]\n"
-        f"ENTRY: [price]\n"
-        f"STOP LOSS: [number]\n"
-        f"TAKE PROFIT: [number]\n"
+        f"ACTION: [LONG/SHORT/WAIT]\n"
+        f"ENTRY: {price}\n"
+        f"STOP LOSS: [number only]\n"
+        f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
-        f"IF NO:\n"
-        f"REASON: [why]\n"
-        f"WAIT FOR: [condition]"
+        f"CONFIDENCE: [0-100%]\n"
+        f"FINAL VERDICT: [explanation of why to take or skip this trade]"
     )
     payload = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 600,
+        "max_tokens": 800,
     }
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_KEY}",
@@ -183,36 +236,46 @@ def webhook():
             return "No data received", 400
 
         symbol = data.get("symbol") or data.get("ticker") or data.get("pair") or "Unknown"
-        raw_price = data.get("price") or data.get("close") or data.get("current_price") or "Unknown"
-        score = data.get("score") or data.get("strength") or data.get("script_strength") or data.get("raw_signal") or "Unknown"
+        raw_price = data.get("price") or data.get("close") or data.get("current_price") or 0
+        score = data.get("score") or data.get("strength") or data.get("raw_signal") or "N/A"
         timeframe = data.get("timeframe") or data.get("interval") or "1H"
         direction = data.get("direction") or data.get("signal") or "Unknown"
+        validator = data.get("validator_status") or "N/A"
+        structure = data.get("structure") or "N/A"
+        session = data.get("session") or "N/A"
+        adx = data.get("adx") or "N/A"
 
         try:
             price = float(raw_price)
         except (TypeError, ValueError):
-            price = raw_price
+            price = 0.0
 
         print(f"Signal: {symbol} at {price} | Score: {score}")
 
         send_telegram(
             f"*SIGNAL TRIGGERED*\n"
-            f"Symbol: {symbol}\n"
-            f"Price: {price}\n"
-            f"Score: {score}/100\n"
-            f"Direction: {direction}\n"
-            f"Timeframe: {timeframe}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Symbol: `{symbol}`\n"
+            f"Price: `{price}`\n"
+            f"Direction: `{direction}`\n"
+            f"Score: `{score}/100`\n"
+            f"Timeframe: `{timeframe}`\n"
+            f"Session: `{session}`\n"
+            f"Structure: `{structure}`\n"
+            f"ADX: `{adx}`\n"
+            f"Validator: `{validator}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"*Analyzing with AI...*"
         )
 
         deepseek = deepseek_analysis(symbol, price, timeframe, data)
-        send_telegram(f"*DEEPSEEK:*\n{deepseek}")
+        send_telegram(f"*DEEPSEEK ANALYSIS:*\n━━━━━━━━━━━━━━━━━━━━━━\n{deepseek}")
 
         chatgpt = chatgpt_analysis(symbol, price, timeframe, data)
-        send_telegram(f"*CHATGPT:*\n{chatgpt}")
+        send_telegram(f"*CHATGPT ANALYSIS:*\n━━━━━━━━━━━━━━━━━━━━━━\n{chatgpt}")
 
         consensus = final_consensus(symbol, price, deepseek, chatgpt)
-        send_telegram(f"*FINAL CONSENSUS:*\n{consensus}")
+        send_telegram(f"*FINAL CONSENSUS:*\n━━━━━━━━━━━━━━━━━━━━━━\n{consensus}")
 
         return "OK", 200
 
