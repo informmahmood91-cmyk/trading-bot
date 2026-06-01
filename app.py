@@ -1,6 +1,8 @@
-import json, requests, os
-from flask import Flask, request
+import json
+import os
 from datetime import datetime
+import requests
+from flask import Flask, request
 
 app = Flask(__name__)
 
@@ -35,8 +37,7 @@ def send_telegram(msg):
 # PARSE INCOMING DATA (FLEXIBLE)
 # ============================================================
 def parse_incoming_data(request_data, request_json, request_text):
-    """Try multiple ways to parse incoming webhook data"""
-    
+    """Try multiple ways to parse incoming webhook data."""
     # Try 1: Already parsed JSON
     if request_json and isinstance(request_json, dict):
         print("✅ Data parsed as JSON")
@@ -48,26 +49,26 @@ def parse_incoming_data(request_data, request_json, request_text):
             parsed = json.loads(request_text)
             print("✅ Raw text parsed as JSON")
             return parsed
-        except:
+        except Exception:
             pass
     
-    # Try 3: Look for form data
+    # Try 3: Form data
     if request_data and isinstance(request_data, dict):
         print("✅ Data from form")
         return request_data
     
-    # Try 4: Extract from request.data
+    # Try 4: Decode raw bytes
     if request_data:
         try:
             if isinstance(request_data, bytes):
-                decoded = request_data.decode('utf-8')
+                decoded = request_data.decode("utf-8")
                 parsed = json.loads(decoded)
                 print("✅ Bytes decoded and parsed")
                 return parsed
-        except:
+        except Exception:
             pass
     
-    # Last resort: Return raw text
+    # Last resort: return raw text wrapped in a dict
     print("⚠️ Using raw text fallback")
     return {"raw_message": str(request_text) if request_text else "No data"}
 
@@ -99,11 +100,20 @@ TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
 REASONING: [short explanation]"""
     
-    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 800,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_KEY}",
+        "Content-Type": "application/json",
+    }
     try:
         r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-        return r.json()['choices'][0]['message']['content']
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"ERROR: {str(e)}"
 
@@ -135,11 +145,20 @@ TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
 REASONING: [short explanation]"""
     
-    payload = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 800}
-    headers = {"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 800,
+    }
+    headers = {
+        "Authorization": f"Bearer {CHATGPT_KEY}",
+        "Content-Type": "application/json",
+    }
     try:
         r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
-        return r.json()['choices'][0]['message']['content']
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"ERROR: {str(e)}"
 
@@ -157,43 +176,54 @@ CHATGPT: {chatgpt_result}
 
 Output EXACTLY:
 AGREEMENT: [YES/NO]
+
 IF YES:
 ACTION: [LONG/SHORT]
 ENTRY: [price]
 STOP LOSS: [number]
 TAKE PROFIT: [number]
 RISK:REWARD: [1:X]
+
 IF NO:
 REASON: [why]
 WAIT FOR: [condition]"""
     
-    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 600}
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 600,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_KEY}",
+        "Content-Type": "application/json",
+    }
     try:
         r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
-        return r.json()['choices'][0]['message']['content']
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 # ============================================================
 # WEBHOOK ENDPOINT
 # ============================================================
-@app.route('/webhook', methods=['POST', 'GET'])
+@app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-    if request.method == 'GET':
+    if request.method == "GET":
         return "Webhook endpoint is working. Send POST requests with trading data.", 200
     
     try:
         # Get data in multiple formats
         request_json = request.get_json(silent=True)
-        request_data = request.form.to_dict() if request.form else None
+        request_form = request.form.to_dict() if request.form else None
         request_text = request.get_data(as_text=True)
         
         print(f"📥 Webhook received. Content-Type: {request.content_type}")
         print(f"📥 Raw data (first 200 chars): {request_text[:200]}")
         
         # Parse the data
-        data = parse_incoming_data(request_data, request_json, request_text)
+        data = parse_incoming_data(request_form, request_json, request_text)
         
         if not data:
             send_telegram("❌ No data received from TradingView")
@@ -202,22 +232,50 @@ def webhook():
         print(f"📊 Parsed data: {json.dumps(data, indent=2)[:500]}")
         
         # Extract signal data (try multiple field names)
-        symbol = data.get('symbol') or data.get('ticker') or data.get('pair') or 'Unknown'
-        price = data.get('price') or data.get('close') or data.get('current_price') or 'Unknown'
-        score = data.get('score') or data.get('strength') or data.get('script_strength') or data.get('raw_signal') or 'Unknown'
-        timeframe = data.get('timeframe') or data.get('interval') or '1H'
-        direction = data.get('direction') or data.get('signal') or 'Unknown'
+        symbol = (
+            data.get("symbol")
+            or data.get("ticker")
+            or data.get("pair")
+            or "Unknown"
+        )
         
-        # Convert price to number if possible
+        raw_price = (
+            data.get("price")
+            or data.get("close")
+            or data.get("current_price")
+            or "Unknown"
+        )
+        
+        score = (
+            data.get("score")
+            or data.get("strength")
+            or data.get("script_strength")
+            or data.get("raw_signal")
+            or "Unknown"
+        )
+        
+        timeframe = data.get("timeframe") or data.get("interval") or "1H"
+        direction = data.get("direction") or data.get("signal") or "Unknown"
+        
+        # Safely convert price to float
         try:
-            price = float(price)
-        except:
-            pass
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            price = raw_price
         
         print(f"🎯 Signal: {symbol} at {price} | Score: {score}")
         
         # Send initial notification
-        send_telegram(f"🎯 *SIGNAL TRIGGERED*\n━━━━━━━━━━━━━━━━━━━━━━\nSymbol: {symbol}\nPrice: {price}\nScore: {score}/100\nDirection: {direction}\nTimeframe: {timeframe}\n\n*Analyzing with AI...*")
+        send_telegram(
+            f"🎯 *SIGNAL TRIGGERED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Symbol: {symbol}\n"
+            f"Price: {price}\n"
+            f"Score: {score}/100\n"
+            f"Direction: {direction}\n"
+            f"Timeframe: {timeframe}\n\n"
+            f"*Analyzing with AI...*"
+        )
         
         # Get AI analyses
         deepseek = deepseek_analysis(symbol, price, timeframe, data)
@@ -240,13 +298,13 @@ def webhook():
 # ============================================================
 # HEALTH CHECK
 # ============================================================
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def root():
     return "Trading Bot is running. Webhook endpoint at /webhook", 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False)
