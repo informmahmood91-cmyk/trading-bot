@@ -1,4 +1,4 @@
-import json, requests, os, urllib.parse
+import json, requests, os
 from flask import Flask, request
 from datetime import datetime
 
@@ -11,6 +11,9 @@ CHATGPT_KEY = os.environ.get("CHATGPT_KEY")
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 CHATGPT_URL = "https://api.openai.com/v1/chat/completions"
+
+# Get your Render URL from environment or use default
+RENDER_URL = os.environ.get("RENDER_URL", "https://trading-bot-5g09.onrender.com")
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -103,6 +106,27 @@ WAIT FOR: [condition]"""
     except Exception as e:
         return f"ERROR: {str(e)}"
 
+# Webhook endpoint for Telegram
+@app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
+def telegram_webhook():
+    try:
+        update = request.get_json()
+        if update and 'message' in update:
+            chat_id = update['message']['chat']['id']
+            text = update['message'].get('text', '')
+            
+            if text == '/start':
+                # Send welcome message through your bot's send function
+                welcome = "🤖 *Trading Bot is Alive!*\n\nI'm ready to receive trading signals from TradingView.\n\nWhen a signal arrives (score 80+), you'll get trade analysis here."
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                requests.post(url, json={"chat_id": chat_id, "text": welcome, "parse_mode": "Markdown"})
+        
+        return "OK", 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return "OK", 200
+
+# Webhook endpoint for TradingView
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET':
@@ -141,9 +165,15 @@ def webhook():
         send_telegram(f"❌ {error_msg}")
         return error_msg, 500
 
+# Health check for Render
 @app.route('/health', methods=['GET'])
 def health():
     return "OK", 200
+
+# Root endpoint
+@app.route('/', methods=['GET'])
+def root():
+    return "Trading Bot is running. Webhook endpoint at /webhook", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
