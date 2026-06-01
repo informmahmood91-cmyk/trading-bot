@@ -270,6 +270,9 @@ def webhook():
 
         print(f"Final parsed data: {json.dumps(data)[:500]}")
 
+        # DEBUG — send raw data to Telegram so we can see what arrived
+        send_telegram(f"*DEBUG RAW DATA:*\n{request_text[:1000]}")
+
         # Extract all fields safely
         symbol   = safe_str(data.get("symbol") or data.get("ticker") or data.get("pair"), "Unknown")
         raw_price = data.get("price") or data.get("close") or data.get("current_price") or 0
