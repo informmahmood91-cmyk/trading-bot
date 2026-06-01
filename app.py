@@ -1,5 +1,5 @@
 import json, requests, os, urllib.parse
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from datetime import datetime
 
 app = Flask(__name__)
@@ -18,6 +18,7 @@ def send_telegram(msg):
         msg = msg[:4000]
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        print("Telegram sent OK")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -104,15 +105,11 @@ WAIT FOR: [condition]"""
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
-    # Handle GET requests (for testing)
     if request.method == 'GET':
         return "Webhook endpoint is working. Send POST requests with trading data.", 200
     
-    # Handle POST requests (TradingView alerts)
     try:
         data = request.get_json()
-        
-        # If no JSON, try to parse form data or text
         if not data and request.data:
             try:
                 data = json.loads(request.data)
