@@ -8,10 +8,11 @@ app = Flask(__name__)
 # ✅ PASTE YOUR KEYS HERE
 # ============================================================
 
-TELEGRAM_TOKEN = "8957910002:AAEv8HiMaVwc29jCVPKMHoEy4t1z7Y6rRdc"
-TELEGRAM_CHAT_ID = "8736138224"
-DEEPSEEK_KEY = "YOUR_DEEPSEEK_API_KEY_HERE"
-CHATGPT_KEY = "YOUR_CHATGPT_API_KEY_HERE"
+# Read keys from environment variables (SECURE)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
+CHATGPT_KEY = os.environ.get("CHATGPT_KEY")
 
 # ============================================================
 # DO NOT CHANGE BELOW THIS LINE
