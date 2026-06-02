@@ -1,254 +1,396 @@
 import json
 import os
-
 import requests
 from flask import Flask, request
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
+# ==========================================
+# ENV VARIABLES
+# ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
 CHATGPT_KEY = os.environ.get("CHATGPT_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
 
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-CHATGPT_URL = "https://api.openai.com/v1/chat/completions"
+# ==========================================
+# API ENDPOINTS
+# ==========================================
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
+# ==========================================
+# STATE CONTROL
+# ==========================================
+pair_session_tracker = {}
+current_day = None
 
+# ==========================================
+# UTILITIES
+# ==========================================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing Telegram config")
+        return
     if len(msg) > 4000:
         msg = msg[:4000]
     try:
-        r = requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10,
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
         )
-        print(f"Telegram sent: {r.status_code}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
 
-def safe_float(value):
-    """Safely convert any value to float."""
-    if value is None:
-        return 0.0
-    try:
-        return float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def safe_str(value, default="N/A"):
-    """Safely convert value to string."""
-    if value is None or value == "" or value == 0:
+def safe_str(v, default="N/A"):
+    if v is None or str(v).strip() == "":
         return default
-    return str(value).strip()
+    return str(v).strip()
 
 
-def parse_incoming_data(request_form, request_json, request_text):
-    """Try every possible way to get the data."""
+def safe_float(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return 0.0
 
-    # Try 1: Clean JSON
+
+def parse_incoming_data(request_json, request_text):
     if request_json and isinstance(request_json, dict):
         print(f"Parsed as JSON: {request_json}")
         return request_json
-
-    # Try 2: Raw text as JSON
     if request_text:
-        cleaned = request_text.strip()
         try:
-            parsed = json.loads(cleaned)
-            print(f"Raw text parsed as JSON: {parsed}")
+            parsed = json.loads(request_text.strip())
+            print(f"Raw text parsed: {parsed}")
             return parsed
         except Exception:
             pass
-
-    # Try 3: Form data
-    if request_form and isinstance(request_form, dict) and len(request_form) > 0:
-        print(f"Form data: {request_form}")
-        return request_form
-
-    print(f"Fallback - raw text: {request_text}")
-    return {"raw_message": str(request_text) if request_text else "No data"}
+    print(f"Could not parse: {request_text}")
+    return {}
 
 
-def deepseek_analysis(symbol, price, timeframe, script_data):
-    prompt = (
-        f"You are a professional trading analyst with knowledge of news and fundamentals.\n\n"
-        f"SIGNAL DATA FROM TRADINGVIEW:\n"
-        f"SYMBOL: {symbol}\n"
-        f"CURRENT PRICE: {price}\n"
-        f"TIMEFRAME: {timeframe}\n"
-        f"DIRECTION: {safe_str(script_data.get('direction'))}\n"
-        f"SIGNAL SCORE: {safe_str(script_data.get('score'))}/100\n"
-        f"ADX TREND STRENGTH: {safe_str(script_data.get('adx'))}\n"
-        f"MARKET STRUCTURE: {safe_str(script_data.get('structure'))}\n"
-        f"SESSION: {safe_str(script_data.get('session'))}\n"
-        f"VWAP PILLAR: {safe_str(script_data.get('pillar_vwap'))}\n"
-        f"PIVOT PILLAR: {safe_str(script_data.get('pillar_pivot'))}\n"
-        f"EMA PILLAR: {safe_str(script_data.get('pillar_ema'))}\n"
-        f"HHHL PILLAR: {safe_str(script_data.get('pillar_hhhl'))}\n"
-        f"AUCTION PILLAR: {safe_str(script_data.get('pillar_auction'))}\n"
-        f"EA SCORE: {safe_str(script_data.get('ea_score'))}\n"
-        f"EA GATE: {safe_str(script_data.get('ea_gate'))}\n"
-        f"VALIDATOR STATUS: {safe_str(script_data.get('validator_status'))}\n"
-        f"VALIDATOR CONFIDENCE: {safe_str(script_data.get('validator_confidence'))}\n"
-        f"VALIDATOR T1 RATE: {safe_str(script_data.get('validator_t1_rate'))}\n"
-        f"VWAP VALUE: {safe_str(script_data.get('vwap'))}\n"
-        f"PIVOT VALUE: {safe_str(script_data.get('pivot'))}\n\n"
-        f"YOUR TASKS:\n"
-        f"1. Use your knowledge of recent NEWS and FUNDAMENTALS for {symbol}\n"
-        f"2. Assess current market sentiment for {symbol}\n"
-        f"3. Validate the technical signal data above\n"
-        f"4. Calculate Stop Loss and Take Profit from price {price}\n\n"
-        f"STRICT RULES:\n"
-        f"- ENTRY must always be exactly: {price}\n"
-        f"- STOP LOSS must be a real number calculated from {price}\n"
-        f"- TAKE PROFIT must be a real number calculated from {price}\n"
-        f"- NEVER write Unknown, N/A or blank for Entry, SL or TP\n"
-        f"- If direction is LONG: SL below price, TP above price\n"
-        f"- If direction is SHORT: SL above price, TP below price\n\n"
-        f"Output EXACTLY in this format with no extra text:\n"
-        f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
-        f"CONFIDENCE: [0-100%]\n"
-        f"ENTRY: {price}\n"
-        f"STOP LOSS: [number only]\n"
-        f"TAKE PROFIT: [number only]\n"
-        f"RISK:REWARD: [1:X]\n"
-        f"NEWS SENTIMENT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
-        f"FUNDAMENTAL BIAS: [BULLISH/BEARISH/NEUTRAL]\n"
-        f"REASONING: [2-3 sentences covering technical + news + fundamentals]"
-    )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 1000,
-    }
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_KEY}",
-        "Content-Type": "application/json",
-    }
+# ==========================================
+# DAILY RESET
+# ==========================================
+def reset_day():
+    global current_day, pair_session_tracker
+    today = datetime.now(timezone.utc).date()
+    if current_day != today:
+        current_day = today
+        pair_session_tracker = {}
+        print(f"Day reset: {today}")
+
+
+# ==========================================
+# SESSION GATE
+# ==========================================
+def session_gate(symbol, session):
+    reset_day()
+    session = safe_str(session).lower()
+    if session in ["ny", "new york", "newyork"]:
+        session = "newyork"
+    if session not in ["london", "newyork"]:
+        return False, f"Invalid session: {session}"
+    key = f"{symbol}_{session}"
+    if key in pair_session_tracker:
+        return False, f"Already traded {symbol} in {session} today"
+    return True, "OK"
+
+
+def register_trade(symbol, session):
+    session = safe_str(session).lower()
+    if session in ["ny", "new york", "newyork"]:
+        session = "newyork"
+    pair_session_tracker[f"{symbol}_{session}"] = True
+    print(f"Trade registered: {symbol} {session}")
+
+
+# ==========================================
+# FINNHUB — LIVE NEWS
+# ==========================================
+def fetch_finnhub(symbol):
+    if not FINNHUB_KEY:
+        return {"sentiment": "NEUTRAL", "text": "No Finnhub key"}
     try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
+        url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        news = r.json()[:5]
+        text = " ".join([n.get("headline", "") for n in news]).lower()
+        bull = sum(w in text for w in ["rise", "bull", "gain", "up", "growth"])
+        bear = sum(w in text for w in ["fall", "bear", "drop", "crash", "recession"])
+        sentiment = "POSITIVE" if bull > bear else "NEGATIVE" if bear > bull else "NEUTRAL"
+        print(f"Finnhub sentiment: {sentiment}")
+        return {"sentiment": sentiment, "text": text[:300]}
     except Exception as e:
-        return f"DEEPSEEK ERROR: {str(e)}"
+        print(f"Finnhub error: {e}")
+        return {"sentiment": "NEUTRAL", "text": "News unavailable"}
 
 
-def chatgpt_analysis(symbol, price, timeframe, script_data):
+# ==========================================
+# GDELT — LIVE MACRO
+# ==========================================
+def fetch_gdelt():
+    try:
+        url = "https://api.gdeltproject.org/api/v2/doc/doc?query=global%20economy&mode=ArtList&format=json"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        articles = r.json().get("articles", [])[:5]
+        risk_words = ["war", "inflation", "crisis", "recession", "sanctions"]
+        score = 0
+        for a in articles:
+            if any(w in a.get("title", "").lower() for w in risk_words):
+                score += 1
+        risk = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
+        print(f"GDELT macro risk: {risk}")
+        return {"risk": risk, "score": score}
+    except Exception as e:
+        print(f"GDELT error: {e}")
+        return {"risk": "LOW", "score": 0}
+
+
+# ==========================================
+# GEMINI — FULL ANALYSIS
+# ==========================================
+def gemini_analysis(signal, news, macro):
+    if not GEMINI_KEY:
+        return "GEMINI ERROR: No API key"
     prompt = (
-        f"You are a professional trading analyst with knowledge of news and fundamentals.\n\n"
-        f"SIGNAL DATA FROM TRADINGVIEW:\n"
-        f"SYMBOL: {symbol}\n"
-        f"CURRENT PRICE: {price}\n"
-        f"TIMEFRAME: {timeframe}\n"
-        f"DIRECTION: {safe_str(script_data.get('direction'))}\n"
-        f"SIGNAL SCORE: {safe_str(script_data.get('score'))}/100\n"
-        f"ADX TREND STRENGTH: {safe_str(script_data.get('adx'))}\n"
-        f"MARKET STRUCTURE: {safe_str(script_data.get('structure'))}\n"
-        f"SESSION: {safe_str(script_data.get('session'))}\n"
-        f"VWAP PILLAR: {safe_str(script_data.get('pillar_vwap'))}\n"
-        f"PIVOT PILLAR: {safe_str(script_data.get('pillar_pivot'))}\n"
-        f"EMA PILLAR: {safe_str(script_data.get('pillar_ema'))}\n"
-        f"HHHL PILLAR: {safe_str(script_data.get('pillar_hhhl'))}\n"
-        f"AUCTION PILLAR: {safe_str(script_data.get('pillar_auction'))}\n"
-        f"EA SCORE: {safe_str(script_data.get('ea_score'))}\n"
-        f"EA GATE: {safe_str(script_data.get('ea_gate'))}\n"
-        f"VALIDATOR STATUS: {safe_str(script_data.get('validator_status'))}\n"
-        f"VALIDATOR CONFIDENCE: {safe_str(script_data.get('validator_confidence'))}\n"
-        f"VALIDATOR T1 RATE: {safe_str(script_data.get('validator_t1_rate'))}\n"
-        f"VWAP VALUE: {safe_str(script_data.get('vwap'))}\n"
-        f"PIVOT VALUE: {safe_str(script_data.get('pivot'))}\n\n"
-        f"YOUR TASKS:\n"
-        f"1. Use your knowledge of recent NEWS and FUNDAMENTALS for {symbol}\n"
-        f"2. Assess current market sentiment for {symbol}\n"
-        f"3. Validate the technical signal data above\n"
-        f"4. Calculate Stop Loss and Take Profit from price {price}\n\n"
+        f"You are a professional MARKET ANALYST with deep knowledge of global markets.\n\n"
+        f"Analyze ALL of the following data sources together:\n\n"
+        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal, indent=2)}\n\n"
+        f"2. LIVE NEWS (Finnhub):\n{json.dumps(news, indent=2)}\n\n"
+        f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
+        f"4. YOUR OWN MARKET KNOWLEDGE:\n"
+        f"   - Use your knowledge of this asset, current trends, correlations\n"
+        f"   - Consider interest rates, geopolitical factors, market sentiment\n\n"
         f"STRICT RULES:\n"
-        f"- ENTRY must always be exactly: {price}\n"
-        f"- STOP LOSS must be a real number calculated from {price}\n"
-        f"- TAKE PROFIT must be a real number calculated from {price}\n"
-        f"- NEVER write Unknown, N/A or blank for Entry, SL or TP\n"
-        f"- If direction is LONG: SL below price, TP above price\n"
-        f"- If direction is SHORT: SL above price, TP below price\n\n"
-        f"Output EXACTLY in this format with no extra text:\n"
-        f"DIRECTION: [BULLISH/BEARISH/NEUTRAL]\n"
+        f"- Combine all 4 sources into one decision\n"
+        f"- Never leave any field blank\n\n"
+        f"Output EXACTLY:\n"
+        f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"CONFIDENCE: [0-100%]\n"
+        f"NEWS IMPACT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
+        f"MACRO RISK: [HIGH/MEDIUM/LOW]\n"
+        f"TECHNICAL VIEW: [brief view on the signal data]\n"
+        f"FUNDAMENTAL VIEW: [brief view from your own knowledge]\n"
+        f"REASON: [2-3 sentences combining all sources]"
+    )
+    try:
+        r = requests.post(
+            GEMINI_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_KEY
+            },
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30
+        )
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"GEMINI ERROR: {str(e)}"
+
+
+# ==========================================
+# GEMINI — DEFEND POSITION (DISAGREEMENT)
+# ==========================================
+def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
+    if not GEMINI_KEY:
+        return "GEMINI ERROR: No API key"
+    prompt = (
+        f"You are a MARKET ANALYST. ChatGPT disagrees with your analysis.\n\n"
+        f"YOUR ORIGINAL ANALYSIS:\n{gemini_first}\n\n"
+        f"CHATGPT QUESTION/CHALLENGE:\n{chatgpt_question}\n\n"
+        f"ORIGINAL DATA FOR REFERENCE:\n"
+        f"Signal: {json.dumps(signal, indent=2)}\n"
+        f"News: {json.dumps(news, indent=2)}\n"
+        f"Macro: {json.dumps(macro, indent=2)}\n\n"
+        f"Give ONE clear response explaining your reasoning.\n"
+        f"Be concise and specific. Maximum 5 sentences.\n\n"
+        f"Output EXACTLY:\n"
+        f"DEFENDING DIRECTION: [BUY/SELL/NEUTRAL]\n"
+        f"KEY REASON 1: [most important reason]\n"
+        f"KEY REASON 2: [second reason]\n"
+        f"KEY REASON 3: [third reason if any]\n"
+        f"SUMMARY: [1 sentence final defense]"
+    )
+    try:
+        r = requests.post(
+            GEMINI_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_KEY
+            },
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30
+        )
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"GEMINI DEFEND ERROR: {str(e)}"
+
+
+# ==========================================
+# CHATGPT — FULL ANALYSIS + GEMINI REVIEW
+# ==========================================
+def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
+    if not CHATGPT_KEY:
+        return "CHATGPT ERROR: No API key"
+    prompt = (
+        f"You are a SENIOR EXECUTION TRADER with deep market knowledge.\n\n"
+        f"Analyze ALL of the following data sources:\n\n"
+        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal, indent=2)}\n\n"
+        f"2. LIVE NEWS (Finnhub):\n{json.dumps(news, indent=2)}\n\n"
+        f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
+        f"4. GEMINI ANALYST VIEW:\n{gemini_out}\n\n"
+        f"5. YOUR OWN MARKET KNOWLEDGE:\n"
+        f"   SYMBOL: {symbol}\n"
+        f"   CURRENT PRICE: {price}\n"
+        f"   TIMEFRAME: {timeframe}\n"
+        f"   Use your own knowledge of this asset, interest rates,\n"
+        f"   correlations, market structure and sentiment\n\n"
+        f"STRICT RULES:\n"
+        f"- ENTRY must be exactly: {price}\n"
+        f"- STOP LOSS must be calculated from {price}\n"
+        f"- TAKE PROFIT must be calculated from {price}\n"
+        f"- If BUY: SL below price, TP above price\n"
+        f"- If SELL: SL above price, TP below price\n"
+        f"- Never write Unknown or blank\n\n"
+        f"Output EXACTLY:\n"
+        f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
+        f"AGREEMENT WITH GEMINI: [YES/NO]\n"
         f"ENTRY: {price}\n"
         f"STOP LOSS: [number only]\n"
         f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
-        f"NEWS SENTIMENT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
-        f"FUNDAMENTAL BIAS: [BULLISH/BEARISH/NEUTRAL]\n"
-        f"REASONING: [2-3 sentences covering technical + news + fundamentals]"
+        f"CONFIDENCE: [0-100%]\n"
+        f"OWN REASONING: [2-3 sentences from your own analysis]\n"
+        f"GEMINI COMPARISON: [1 sentence on why you agree or disagree]"
     )
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 1000,
-    }
-    headers = {
-        "Authorization": f"Bearer {CHATGPT_KEY}",
-        "Content-Type": "application/json",
-    }
     try:
-        r = requests.post(CHATGPT_URL, headers=headers, json=payload, timeout=60)
+        r = requests.post(
+            OPENAI_URL,
+            headers={
+                "Authorization": f"Bearer {CHATGPT_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1000
+            },
+            timeout=45
+        )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"CHATGPT ERROR: {str(e)}"
 
 
-def final_consensus(symbol, price, deepseek_result, chatgpt_result):
+# ==========================================
+# CHATGPT — CHALLENGE GEMINI (1 MESSAGE)
+# ==========================================
+def chatgpt_challenge(symbol, price, chatgpt_view, gemini_view):
+    if not CHATGPT_KEY:
+        return "CHATGPT ERROR: No API key"
     prompt = (
-        f"You are the final decision maker. Two AI analysts reviewed a trade signal.\n\n"
+        f"You are a SENIOR TRADER. You disagree with Gemini analyst.\n\n"
+        f"YOUR ANALYSIS:\n{chatgpt_view}\n\n"
+        f"GEMINI ANALYSIS:\n{gemini_view}\n\n"
+        f"Send Gemini ONE clear challenge message explaining:\n"
+        f"- Why you disagree\n"
+        f"- What specific data points support your view\n"
+        f"- What you need Gemini to clarify\n\n"
+        f"Be direct and concise. Maximum 4 sentences.\n"
+        f"Do NOT make a final decision yet. Just challenge Gemini."
+    )
+    try:
+        r = requests.post(
+            OPENAI_URL,
+            headers={
+                "Authorization": f"Bearer {CHATGPT_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 400
+            },
+            timeout=45
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"CHATGPT CHALLENGE ERROR: {str(e)}"
+
+
+# ==========================================
+# CHATGPT — FINAL DECISION AFTER GEMINI REPLY
+# ==========================================
+def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
+                  chatgpt_challenge_msg, gemini_defense):
+    if not CHATGPT_KEY:
+        return "CHATGPT ERROR: No API key"
+    prompt = (
+        f"You are a SENIOR EXECUTION TRADER making the ABSOLUTE FINAL decision.\n\n"
         f"SYMBOL: {symbol}\n"
-        f"CURRENT PRICE: {price}\n\n"
-        f"DEEPSEEK ANALYSIS:\n{deepseek_result}\n\n"
-        f"CHATGPT ANALYSIS:\n{chatgpt_result}\n\n"
-        f"YOUR TASKS:\n"
-        f"1. Compare both analyses\n"
-        f"2. Check if they agree on direction\n"
-        f"3. Pick the best SL and TP from both\n"
-        f"4. Give a clear final verdict\n\n"
+        f"PRICE: {price}\n\n"
+        f"FULL CONTEXT:\n\n"
+        f"Your original analysis:\n{chatgpt_view}\n\n"
+        f"Gemini original analysis:\n{gemini_first}\n\n"
+        f"Your challenge to Gemini:\n{chatgpt_challenge_msg}\n\n"
+        f"Gemini defense:\n{gemini_defense}\n\n"
+        f"Original signal:\n{json.dumps(signal, indent=2)}\n\n"
+        f"You have heard both sides. Make the FINAL call.\n"
+        f"No more discussion after this.\n\n"
         f"STRICT RULES:\n"
-        f"- ENTRY must always be exactly: {price}\n"
-        f"- STOP LOSS must be a real number\n"
-        f"- TAKE PROFIT must be a real number\n"
-        f"- NEVER write Unknown or blank\n\n"
-        f"Output EXACTLY in this format:\n"
-        f"AGREEMENT: [YES/NO]\n"
-        f"ACTION: [LONG/SHORT/WAIT]\n"
+        f"- ENTRY must be exactly: {price}\n"
+        f"- STOP LOSS must be a real number from {price}\n"
+        f"- TAKE PROFIT must be a real number from {price}\n"
+        f"- If BUY: SL below price, TP above price\n"
+        f"- If SELL: SL above price, TP below price\n"
+        f"- Never write Unknown or blank\n\n"
+        f"Output EXACTLY:\n"
+        f"FINAL DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"ENTRY: {price}\n"
         f"STOP LOSS: [number only]\n"
         f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
         f"CONFIDENCE: [0-100%]\n"
-        f"FINAL VERDICT: [2-3 sentences on why to take or skip this trade]"
+        f"WHY THIS DECISION: [2-3 sentences final reasoning]"
     )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 800,
-    }
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_KEY}",
-        "Content-Type": "application/json",
-    }
     try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=90)
+        r = requests.post(
+            OPENAI_URL,
+            headers={
+                "Authorization": f"Bearer {CHATGPT_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 800
+            },
+            timeout=45
+        )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"CONSENSUS ERROR: {str(e)}"
+        return f"CHATGPT FINAL ERROR: {str(e)}"
 
 
+# ==========================================
+# WEBHOOK
+# ==========================================
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
@@ -256,43 +398,43 @@ def webhook():
 
     try:
         request_json = request.get_json(silent=True, force=True)
-        request_form = request.form.to_dict() if request.form else None
         request_text = request.get_data(as_text=True)
 
         print(f"Content-Type: {request.content_type}")
         print(f"Raw data: {request_text[:500]}")
 
-        data = parse_incoming_data(request_form, request_json, request_text)
+        data = parse_incoming_data(request_json, request_text)
 
         if not data:
             send_telegram("No data received from TradingView")
             return "No data received", 400
 
-        print(f"Final parsed data: {json.dumps(data)[:500]}")
-
-        # DEBUG — send raw data to Telegram so we can see what arrived
-        send_telegram(f"*DEBUG RAW DATA:*\n{request_text[:1000]}")
-
-        # Extract all fields safely
-        symbol   = safe_str(data.get("symbol") or data.get("ticker") or data.get("pair"), "Unknown")
-        raw_price = data.get("price") or data.get("close") or data.get("current_price") or 0
-        price    = safe_float(raw_price)
-        score    = safe_str(data.get("score") or data.get("strength") or data.get("raw_signal"), "N/A")
+        # Extract fields
+        symbol    = safe_str(data.get("symbol") or data.get("ticker"), "Unknown")
+        price     = safe_float(data.get("price") or data.get("close") or 0)
         timeframe = safe_str(data.get("timeframe") or data.get("interval"), "1H")
-        direction = safe_str(data.get("direction") or data.get("signal"), "Unknown")
-        validator = safe_str(data.get("validator_status"), "N/A")
-        validator_conf = safe_str(data.get("validator_confidence"), "N/A")
+        session   = safe_str(data.get("session"), "london")
+        direction = safe_str(data.get("direction"), "Unknown")
+        score     = safe_str(data.get("score"), "N/A")
+        adx       = safe_str(data.get("adx"), "N/A")
         structure = safe_str(data.get("structure"), "N/A")
-        session  = safe_str(data.get("session"), "N/A")
-        adx      = safe_str(data.get("adx"), "N/A")
-        ea_gate  = safe_str(data.get("ea_gate"), "N/A")
-        ea_score = safe_str(data.get("ea_score"), "N/A")
 
-        print(f"Symbol: {symbol} | Price: {price} | Direction: {direction} | Score: {score}")
+        print(f"Symbol: {symbol} | Price: {price} | Session: {session}")
 
-        # Send signal notification — no backticks to avoid Markdown issues
+        # STEP 1 — Session gate
+        allowed, reason = session_gate(symbol, session)
+        if not allowed:
+            send_telegram(
+                f"SIGNAL BLOCKED\n"
+                f"---------------------------\n"
+                f"Symbol: {symbol}\n"
+                f"Reason: {reason}"
+            )
+            return "Blocked", 200
+
+        # STEP 2 — Signal notification
         send_telegram(
-            f"*SIGNAL TRIGGERED*\n"
+            f"NEW SIGNAL RECEIVED\n"
             f"---------------------------\n"
             f"Symbol: {symbol}\n"
             f"Price: {price}\n"
@@ -300,34 +442,101 @@ def webhook():
             f"Score: {score}/100\n"
             f"Timeframe: {timeframe}\n"
             f"Session: {session}\n"
-            f"Structure: {structure}\n"
             f"ADX: {adx}\n"
-            f"EA Score: {ea_score}\n"
-            f"EA Gate: {ea_gate}\n"
-            f"Validator: {validator}\n"
-            f"Validator Conf: {validator_conf}\n"
+            f"Structure: {structure}\n"
             f"---------------------------\n"
-            f"*Analyzing with AI...*"
+            f"Fetching live news and macro..."
         )
 
-        deepseek = deepseek_analysis(symbol, price, timeframe, data)
-        send_telegram(f"*DEEPSEEK ANALYSIS:*\n---------------------------\n{deepseek}")
+        # STEP 3 — Fetch live data
+        news  = fetch_finnhub(symbol)
+        macro = fetch_gdelt()
 
-        chatgpt = chatgpt_analysis(symbol, price, timeframe, data)
-        send_telegram(f"*CHATGPT ANALYSIS:*\n---------------------------\n{chatgpt}")
+        send_telegram(
+            f"LIVE DATA FETCHED\n"
+            f"---------------------------\n"
+            f"News Sentiment: {news['sentiment']}\n"
+            f"Macro Risk: {macro['risk']}\n"
+            f"---------------------------\n"
+            f"Running Gemini analysis..."
+        )
 
-        consensus = final_consensus(symbol, price, deepseek, chatgpt)
-        send_telegram(f"*FINAL CONSENSUS:*\n---------------------------\n{consensus}")
+        # STEP 4 — Gemini full analysis
+        gemini = gemini_analysis(data, news, macro)
+        send_telegram(f"GEMINI ANALYSIS:\n---------------------------\n{gemini}")
+
+        # STEP 5 — ChatGPT full analysis including Gemini
+        send_telegram("Running ChatGPT analysis...")
+        chatgpt = chatgpt_analysis(
+            symbol, price, timeframe, data, news, macro, gemini
+        )
+        send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
+
+        # STEP 6 — Agreement check
+        gemini_buy   = "buy" in gemini.lower()
+        gemini_sell  = "sell" in gemini.lower()
+        chatgpt_buy  = "buy" in chatgpt.lower()
+        chatgpt_sell = "sell" in chatgpt.lower()
+
+        agreement = (
+            (gemini_buy and chatgpt_buy) or
+            (gemini_sell and chatgpt_sell)
+        )
+
+        if agreement:
+            # STEP 7A — Both agree, print final
+            send_telegram(
+                f"FINAL DECISION (BOTH AGREED)\n"
+                f"---------------------------\n"
+                f"{chatgpt}"
+            )
+
+        else:
+            # STEP 7B — Disagreement: ChatGPT sends 1 challenge to Gemini
+            send_telegram("Disagreement detected. ChatGPT challenging Gemini...")
+
+            challenge = chatgpt_challenge(symbol, price, chatgpt, gemini)
+            send_telegram(
+                f"CHATGPT CHALLENGE TO GEMINI:\n"
+                f"---------------------------\n"
+                f"{challenge}"
+            )
+
+            # STEP 7C — Gemini responds once
+            gemini_reply = gemini_defend(data, news, macro, gemini, challenge)
+            send_telegram(
+                f"GEMINI DEFENSE:\n"
+                f"---------------------------\n"
+                f"{gemini_reply}"
+            )
+
+            # STEP 7D — ChatGPT makes FINAL decision, no more discussion
+            final = chatgpt_final(
+                symbol, price, data,
+                chatgpt, gemini,
+                challenge, gemini_reply
+            )
+            send_telegram(
+                f"FINAL DECISION (CHATGPT AFTER DEBATE)\n"
+                f"---------------------------\n"
+                f"{final}"
+            )
+
+        # STEP 8 — Register trade
+        register_trade(symbol, session)
 
         return "OK", 200
 
     except Exception as e:
         error_msg = f"ERROR: {str(e)[:200]}"
-        print(f"{error_msg}")
-        send_telegram(f"*System Error:*\n{error_msg}")
+        print(error_msg)
+        send_telegram(f"System Error:\n{error_msg}")
         return error_msg, 500
 
 
+# ==========================================
+# HEALTH CHECK
+# ==========================================
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
