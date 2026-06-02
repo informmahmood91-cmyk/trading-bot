@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import requests
 from flask import Flask, request
 from datetime import datetime, timezone
@@ -155,11 +156,11 @@ def fetch_gdelt():
 
 
 # ==========================================
-# GEMINI — FULL ANALYSIS
+# GEMINI — FULL ANALYSIS (WITH RETRY)
 # ==========================================
 def gemini_analysis(signal, news, macro):
     if not GEMINI_KEY:
-        return "GEMINI ERROR: No API key"
+        return "GEMINI UNAVAILABLE: No API key"
     prompt = (
         f"You are a professional MARKET ANALYST with deep knowledge of global markets.\n\n"
         f"Analyze ALL of the following data sources together:\n\n"
@@ -181,28 +182,32 @@ def gemini_analysis(signal, news, macro):
         f"FUNDAMENTAL VIEW: [brief view from your own knowledge]\n"
         f"REASON: [2-3 sentences combining all sources]"
     )
-    try:
-        r = requests.post(
-            GEMINI_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_KEY
-            },
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30
-        )
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"GEMINI ERROR: {str(e)}"
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                GEMINI_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_KEY
+                },
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=30
+            )
+            r.raise_for_status()
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            print(f"Gemini attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(3)
+    return "GEMINI UNAVAILABLE: Server busy, ChatGPT will decide alone"
 
 
 # ==========================================
-# GEMINI — DEFEND POSITION (DISAGREEMENT)
+# GEMINI — DEFEND POSITION (WITH RETRY)
 # ==========================================
 def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
     if not GEMINI_KEY:
-        return "GEMINI ERROR: No API key"
+        return "GEMINI UNAVAILABLE: No API key"
     prompt = (
         f"You are a MARKET ANALYST. ChatGPT disagrees with your analysis.\n\n"
         f"YOUR ORIGINAL ANALYSIS:\n{gemini_first}\n\n"
@@ -220,20 +225,24 @@ def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
         f"KEY REASON 3: [third reason if any]\n"
         f"SUMMARY: [1 sentence final defense]"
     )
-    try:
-        r = requests.post(
-            GEMINI_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_KEY
-            },
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30
-        )
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"GEMINI DEFEND ERROR: {str(e)}"
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                GEMINI_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_KEY
+                },
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=30
+            )
+            r.raise_for_status()
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            print(f"Gemini defend attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(3)
+    return "GEMINI UNAVAILABLE: Could not defend position"
 
 
 # ==========================================
@@ -261,6 +270,7 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
         f"- TAKE PROFIT must be calculated from {price}\n"
         f"- If BUY: SL below price, TP above price\n"
         f"- If SELL: SL above price, TP below price\n"
+        f"- Use ATR value from signal for SL/TP sizing if available\n"
         f"- Never write Unknown or blank\n\n"
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
@@ -357,6 +367,7 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
         f"- TAKE PROFIT must be a real number from {price}\n"
         f"- If BUY: SL below price, TP above price\n"
         f"- If SELL: SL above price, TP below price\n"
+        f"- Use ATR from signal for SL/TP sizing if available\n"
         f"- Never write Unknown or blank\n\n"
         f"Output EXACTLY:\n"
         f"FINAL DIRECTION: [BUY/SELL/NEUTRAL]\n"
@@ -412,12 +423,19 @@ def webhook():
         # Extract fields
         symbol    = safe_str(data.get("symbol") or data.get("ticker"), "Unknown")
         price     = safe_float(data.get("price") or data.get("close") or 0)
-        timeframe = safe_str(data.get("timeframe") or data.get("interval"), "1H")
+        timeframe = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
         session   = safe_str(data.get("session"), "london")
         direction = safe_str(data.get("direction"), "Unknown")
         score     = safe_str(data.get("score"), "N/A")
         adx       = safe_str(data.get("adx"), "N/A")
-        structure = safe_str(data.get("structure"), "N/A")
+        structure = safe_str(data.get("structure_bias") or data.get("structure"), "N/A")
+        atr       = safe_str(data.get("atr"), "N/A")
+        ema_21    = safe_str(data.get("ema_21"), "N/A")
+        ema_50    = safe_str(data.get("ema_50"), "N/A")
+        ema_200   = safe_str(data.get("ema_200"), "N/A")
+        volume    = safe_str(data.get("volume_ratio"), "N/A")
+        validator = safe_str(data.get("validator"), "N/A")
+        confidence = safe_str(data.get("confidence"), "N/A")
 
         print(f"Symbol: {symbol} | Price: {price} | Session: {session}")
 
@@ -443,7 +461,12 @@ def webhook():
             f"Timeframe: {timeframe}\n"
             f"Session: {session}\n"
             f"ADX: {adx}\n"
+            f"ATR: {atr}\n"
             f"Structure: {structure}\n"
+            f"EMA 21/50/200: {ema_21} / {ema_50} / {ema_200}\n"
+            f"Volume Ratio: {volume}\n"
+            f"Validator: {validator}\n"
+            f"Confidence: {confidence}\n"
             f"---------------------------\n"
             f"Fetching live news and macro..."
         )
@@ -465,14 +488,26 @@ def webhook():
         gemini = gemini_analysis(data, news, macro)
         send_telegram(f"GEMINI ANALYSIS:\n---------------------------\n{gemini}")
 
-        # STEP 5 — ChatGPT full analysis including Gemini
+        # STEP 5 — Handle Gemini failure
+        if "GEMINI UNAVAILABLE" in gemini:
+            send_telegram("Gemini unavailable. ChatGPT analyzing alone...")
+            chatgpt = chatgpt_analysis(
+                symbol, price, timeframe, data, news, macro,
+                "Gemini unavailable. Use your own analysis only."
+            )
+            send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
+            send_telegram(f"FINAL DECISION (CHATGPT ONLY)\n---------------------------\n{chatgpt}")
+            register_trade(symbol, session)
+            return "OK", 200
+
+        # STEP 6 — ChatGPT full analysis including Gemini
         send_telegram("Running ChatGPT analysis...")
         chatgpt = chatgpt_analysis(
             symbol, price, timeframe, data, news, macro, gemini
         )
         send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
 
-        # STEP 6 — Agreement check
+        # STEP 7 — Agreement check
         gemini_buy   = "buy" in gemini.lower()
         gemini_sell  = "sell" in gemini.lower()
         chatgpt_buy  = "buy" in chatgpt.lower()
@@ -484,7 +519,7 @@ def webhook():
         )
 
         if agreement:
-            # STEP 7A — Both agree, print final
+            # Both agree — ChatGPT result is final
             send_telegram(
                 f"FINAL DECISION (BOTH AGREED)\n"
                 f"---------------------------\n"
@@ -492,7 +527,7 @@ def webhook():
             )
 
         else:
-            # STEP 7B — Disagreement: ChatGPT sends 1 challenge to Gemini
+            # Disagreement — ChatGPT sends 1 challenge to Gemini
             send_telegram("Disagreement detected. ChatGPT challenging Gemini...")
 
             challenge = chatgpt_challenge(symbol, price, chatgpt, gemini)
@@ -502,7 +537,7 @@ def webhook():
                 f"{challenge}"
             )
 
-            # STEP 7C — Gemini responds once
+            # Gemini responds once
             gemini_reply = gemini_defend(data, news, macro, gemini, challenge)
             send_telegram(
                 f"GEMINI DEFENSE:\n"
@@ -510,7 +545,7 @@ def webhook():
                 f"{gemini_reply}"
             )
 
-            # STEP 7D — ChatGPT makes FINAL decision, no more discussion
+            # ChatGPT makes FINAL decision — no more discussion
             final = chatgpt_final(
                 symbol, price, data,
                 chatgpt, gemini,
