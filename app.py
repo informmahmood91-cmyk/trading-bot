@@ -88,29 +88,36 @@ def reset_day():
 
 
 # ==========================================
-# SESSION GATE
+# TIME BASED SESSION DETECTION
 # ==========================================
-def session_gate(symbol, session):
+def get_session_by_time():
+    # Pakistan time is UTC+5
+    now_utc = datetime.now(timezone.utc)
+    pk_hour = (now_utc.hour + 5) % 24
+
+    if 12 <= pk_hour < 18:
+        return "london"
+    elif 18 <= pk_hour or pk_hour < 2:
+        return "newyork"
+    else:
+        return "off"
+
+
+def session_gate(symbol):
     reset_day()
-    session = safe_str(session).lower()
-    if session in ["ny", "new york", "newyork", "new_york"]:
-        session = "newyork"
-    if session in ["lon", "lnd", "ldn", "london"]:
-        session = "london"
-    if session not in ["london", "newyork"]:
-        return False, f"Invalid session: {session}"
+    session = get_session_by_time()
+
+    if session == "off":
+        return False, "Outside trading sessions", session
+
     key = f"{symbol}_{session}"
     if key in pair_session_tracker:
-        return False, f"Already traded {symbol} in {session} today"
-    return True, "OK"
+        return False, f"Already traded {symbol} in {session} today", session
+
+    return True, "OK", session
 
 
 def register_trade(symbol, session):
-    session = safe_str(session).lower()
-    if session in ["ny", "new york", "newyork", "new_york"]:
-        session = "newyork"
-    if session in ["lon", "lnd", "ldn", "london"]:
-        session = "london"
     pair_session_tracker[f"{symbol}_{session}"] = True
     print(f"Trade registered: {symbol} {session}")
 
@@ -177,6 +184,12 @@ def gemini_analysis(signal, news, macro):
         f"STRICT RULES:\n"
         f"- Combine all 4 sources into one decision\n"
         f"- Never leave any field blank\n\n"
+        f"TECHNICAL OVERRIDE RULES:\n"
+        f"- If structure_bias is BEAR and score direction is SHORT — do NOT recommend BUY\n"
+        f"- If structure_bias is BULL and score direction is LONG — do NOT recommend SELL\n"
+        f"- Technical signal is PRIMARY — news and fundamentals are SUPPORTING only\n"
+        f"- You may increase/decrease confidence based on news but cannot reverse technical direction\n"
+        f"- Only recommend NEUTRAL if technical and fundamental are completely opposite\n\n"
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"CONFIDENCE: [0-100%]\n"
@@ -276,6 +289,12 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
         f"- If SELL: SL above price, TP below price\n"
         f"- Use ATR value from signal for SL/TP sizing if available\n"
         f"- Never write Unknown or blank\n\n"
+        f"TECHNICAL OVERRIDE RULES:\n"
+        f"- If structure_bias is BEAR and score direction is SHORT — do NOT recommend BUY\n"
+        f"- If structure_bias is BULL and score direction is LONG — do NOT recommend SELL\n"
+        f"- Technical signal is PRIMARY — news and fundamentals are SUPPORTING only\n"
+        f"- You may increase/decrease confidence based on news but cannot reverse technical direction\n"
+        f"- Only recommend NEUTRAL if technical and fundamental are completely opposite\n\n"
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"AGREEMENT WITH GEMINI: [YES/NO]\n"
@@ -298,7 +317,7 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 1000
+                "max_tokens": 1500
             },
             timeout=45
         )
@@ -443,13 +462,14 @@ def webhook():
 
         print(f"Symbol: {symbol} | Price: {price} | Session: {session}")
 
-        # STEP 1 — Session gate
-        allowed, reason = session_gate(symbol, session)
+        # STEP 1 — Session gate by local time
+        allowed, reason, session = session_gate(symbol)
         if not allowed:
             send_telegram(
                 f"SIGNAL BLOCKED\n"
                 f"---------------------------\n"
                 f"Symbol: {symbol}\n"
+                f"Session: {session}\n"
                 f"Reason: {reason}"
             )
             return "Blocked", 200
@@ -512,26 +532,31 @@ def webhook():
         send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
 
         # STEP 7 — Agreement check
-        gemini_buy   = "buy" in gemini.lower()
-        gemini_sell  = "sell" in gemini.lower()
-        chatgpt_buy  = "buy" in chatgpt.lower()
-        chatgpt_sell = "sell" in chatgpt.lower()
+        gemini_buy     = "buy" in gemini.lower()
+        gemini_sell    = "sell" in gemini.lower()
+        gemini_neutral = "neutral" in gemini.lower()
+        chatgpt_buy    = "buy" in chatgpt.lower()
+        chatgpt_sell   = "sell" in chatgpt.lower()
+        chatgpt_neutral = "neutral" in chatgpt.lower()
 
-        agreement = (
-            (gemini_buy and chatgpt_buy) or
-            (gemini_sell and chatgpt_sell)
-        )
+        # If either is neutral — ChatGPT decides alone no debate
+        if gemini_neutral or chatgpt_neutral:
+            send_telegram(
+                f"FINAL DECISION (CHATGPT ONLY — NEUTRAL DETECTED)\n"
+                f"---------------------------\n"
+                f"{chatgpt}"
+            )
 
-        if agreement:
-            # Both agree — ChatGPT result is final
+        # Both agree on same direction
+        elif (gemini_buy and chatgpt_buy) or (gemini_sell and chatgpt_sell):
             send_telegram(
                 f"FINAL DECISION (BOTH AGREED)\n"
                 f"---------------------------\n"
                 f"{chatgpt}"
             )
 
+        # Both disagree — start debate
         else:
-            # Disagreement — ChatGPT sends 1 challenge to Gemini
             send_telegram("Disagreement detected. ChatGPT challenging Gemini...")
 
             challenge = chatgpt_challenge(symbol, price, chatgpt, gemini)
@@ -541,7 +566,6 @@ def webhook():
                 f"{challenge}"
             )
 
-            # Gemini responds once
             gemini_reply = gemini_defend(data, news, macro, gemini, challenge)
             send_telegram(
                 f"GEMINI DEFENSE:\n"
@@ -549,7 +573,6 @@ def webhook():
                 f"{gemini_reply}"
             )
 
-            # ChatGPT makes FINAL decision — no more discussion
             final = chatgpt_final(
                 symbol, price, data,
                 chatgpt, gemini,
