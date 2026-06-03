@@ -93,8 +93,10 @@ def reset_day():
 def session_gate(symbol, session):
     reset_day()
     session = safe_str(session).lower()
-    if session in ["ny", "new york", "newyork"]:
+    if session in ["ny", "new york", "newyork", "new_york"]:
         session = "newyork"
+    if session in ["lon", "lnd", "ldn", "london"]:
+        session = "london"
     if session not in ["london", "newyork"]:
         return False, f"Invalid session: {session}"
     key = f"{symbol}_{session}"
@@ -105,8 +107,10 @@ def session_gate(symbol, session):
 
 def register_trade(symbol, session):
     session = safe_str(session).lower()
-    if session in ["ny", "new york", "newyork"]:
+    if session in ["ny", "new york", "newyork", "new_york"]:
         session = "newyork"
+    if session in ["lon", "lnd", "ldn", "london"]:
+        session = "london"
     pair_session_tracker[f"{symbol}_{session}"] = True
     print(f"Trade registered: {symbol} {session}")
 
