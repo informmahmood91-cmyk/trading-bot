@@ -317,7 +317,7 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 1500
+                "max_tokens": 1000
             },
             timeout=45
         )
