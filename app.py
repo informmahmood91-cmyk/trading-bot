@@ -15,6 +15,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 CHATGPT_KEY = os.environ.get("CHATGPT_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY")
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")  # NEW
 
 # ==========================================
 # API ENDPOINTS
@@ -167,22 +168,125 @@ def fetch_gdelt():
 
 
 # ==========================================
+# TWELVE DATA — 10 TECHNICAL INDICATORS
+# ==========================================
+def fetch_twelve_data(symbol):
+    if not TWELVE_DATA_KEY:
+        print("Twelve Data: No API key")
+        return {}
+    
+    # Clean symbol (EURUSD -> EUR/USD)
+    if "/" not in symbol and len(symbol) == 6:
+        symbol = f"{symbol[:3]}/{symbol[3:]}"
+    
+    base_url = "https://api.twelvedata.com"
+    api_key = TWELVE_DATA_KEY
+    
+    # 10 indicators as requested
+    indicators = {
+        # 1. RSI
+        "rsi": f"{base_url}/rsi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        # 2. MACD
+        "macd": f"{base_url}/macd?symbol={symbol}&interval=1h&apikey={api_key}",
+        # 3. Stochastic
+        "stoch": f"{base_url}/stoch?symbol={symbol}&interval=1h&apikey={api_key}",
+        # 4. CCI
+        "cci": f"{base_url}/cci?symbol={symbol}&interval=1h&time_period=20&apikey={api_key}",
+        # 5. MFI
+        "mfi": f"{base_url}/mfi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        # 6. Williams %R
+        "willr": f"{base_url}/willr?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        # 7. OBV
+        "obv": f"{base_url}/obv?symbol={symbol}&interval=1h&apikey={api_key}",
+        # 8. Aroon
+        "aroon": f"{base_url}/aroon?symbol={symbol}&interval=1h&time_period=25&apikey={api_key}",
+        # 9. Ichimoku Cloud
+        "ichimoku": f"{base_url}/ichimoku?symbol={symbol}&interval=1h&apikey={api_key}",
+        # 10. Parabolic SAR
+        "psar": f"{base_url}/psar?symbol={symbol}&interval=1h&apikey={api_key}",
+    }
+    
+    results = {}
+    for name, url in indicators.items():
+        try:
+            resp = requests.get(url, timeout=8).json()
+            if resp.get("values"):
+                results[name] = resp["values"][0]
+            elif resp.get("value"):
+                results[name] = resp["value"]
+            else:
+                results[name] = "N/A"
+        except Exception as e:
+            print(f"Twelve Data {name} error: {e}")
+            results[name] = "N/A"
+        
+        # Small delay to avoid rate limits
+        time.sleep(0.1)
+    
+    # Parse each indicator's values
+    return {
+        # RSI
+        "rsi": results.get("rsi", {}).get("rsi", "N/A"),
+        # MACD
+        "macd": results.get("macd", {}).get("macd", "N/A"),
+        "macd_signal": results.get("macd", {}).get("macd_signal", "N/A"),
+        "macd_histogram": results.get("macd", {}).get("macd_histogram", "N/A"),
+        # Stochastic
+        "stoch_k": results.get("stoch", {}).get("slowk", "N/A"),
+        "stoch_d": results.get("stoch", {}).get("slowd", "N/A"),
+        # CCI
+        "cci": results.get("cci", {}).get("cci", "N/A"),
+        # MFI
+        "mfi": results.get("mfi", {}).get("mfi", "N/A"),
+        # Williams %R
+        "willr": results.get("willr", {}).get("willr", "N/A"),
+        # OBV
+        "obv": results.get("obv", {}).get("obv", "N/A"),
+        # Aroon
+        "aroon_up": results.get("aroon", {}).get("aroon_up", "N/A"),
+        "aroon_down": results.get("aroon", {}).get("aroon_down", "N/A"),
+        # Ichimoku
+        "ichimoku_conversion": results.get("ichimoku", {}).get("tenkan_sen", "N/A"),
+        "ichimoku_base": results.get("ichimoku", {}).get("kijun_sen", "N/A"),
+        "ichimoku_span_a": results.get("ichimoku", {}).get("senkou_span_a", "N/A"),
+        "ichimoku_span_b": results.get("ichimoku", {}).get("senkou_span_b", "N/A"),
+        # Parabolic SAR
+        "psar": results.get("psar", {}).get("psar", "N/A"),
+    }
+
+
+# ==========================================
 # GEMINI — FULL ANALYSIS (WITH RETRY)
 # ==========================================
 def gemini_analysis(signal, news, macro):
     if not GEMINI_KEY:
         return "GEMINI UNAVAILABLE: No API key"
+    
+    # Extract Twelve Data indicators
+    twelve = signal.get("twelve_data", {})
+    
     prompt = (
         f"You are a professional MARKET ANALYST with deep knowledge of global markets.\n\n"
         f"Analyze ALL of the following data sources together:\n\n"
-        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal, indent=2)}\n\n"
+        f"1. TRADINGVIEW SIGNAL:\n{json.dumps({k: v for k, v in signal.items() if k != 'twelve_data'}, indent=2)}\n\n"
         f"2. LIVE NEWS (Finnhub):\n{json.dumps(news, indent=2)}\n\n"
         f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
-        f"4. YOUR OWN MARKET KNOWLEDGE:\n"
+        f"4. TWELVE DATA TECHNICAL INDICATORS (LIVE):\n"
+        f"   RSI: {twelve.get('rsi', 'N/A')}\n"
+        f"   MACD: {twelve.get('macd', 'N/A')} (Signal: {twelve.get('macd_signal', 'N/A')}, Histogram: {twelve.get('macd_histogram', 'N/A')})\n"
+        f"   Stochastic: K={twelve.get('stoch_k', 'N/A')}, D={twelve.get('stoch_d', 'N/A')}\n"
+        f"   CCI: {twelve.get('cci', 'N/A')}\n"
+        f"   MFI: {twelve.get('mfi', 'N/A')}\n"
+        f"   Williams %R: {twelve.get('willr', 'N/A')}\n"
+        f"   OBV: {twelve.get('obv', 'N/A')}\n"
+        f"   Aroon: Up={twelve.get('aroon_up', 'N/A')}, Down={twelve.get('aroon_down', 'N/A')}\n"
+        f"   Ichimoku: Conversion={twelve.get('ichimoku_conversion', 'N/A')}, Base={twelve.get('ichimoku_base', 'N/A')}, SpanA={twelve.get('ichimoku_span_a', 'N/A')}, SpanB={twelve.get('ichimoku_span_b', 'N/A')}\n"
+        f"   Parabolic SAR: {twelve.get('psar', 'N/A')}\n\n"
+        f"5. YOUR OWN MARKET KNOWLEDGE:\n"
         f"   - Use your knowledge of this asset, current trends, correlations\n"
         f"   - Consider interest rates, geopolitical factors, market sentiment\n\n"
         f"STRICT RULES:\n"
-        f"- Combine all 4 sources into one decision\n"
+        f"- Combine all 5 sources into one decision\n"
         f"- Never leave any field blank\n\n"
         f"TECHNICAL OVERRIDE RULES:\n"
         f"- If structure_bias is BEAR and score direction is SHORT — do NOT recommend BUY\n"
@@ -225,12 +329,16 @@ def gemini_analysis(signal, news, macro):
 def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
     if not GEMINI_KEY:
         return "GEMINI UNAVAILABLE: No API key"
+    
+    twelve = signal.get("twelve_data", {})
+    
     prompt = (
         f"You are a MARKET ANALYST. ChatGPT disagrees with your analysis.\n\n"
         f"YOUR ORIGINAL ANALYSIS:\n{gemini_first}\n\n"
         f"CHATGPT QUESTION/CHALLENGE:\n{chatgpt_question}\n\n"
         f"ORIGINAL DATA FOR REFERENCE:\n"
-        f"Signal: {json.dumps(signal, indent=2)}\n"
+        f"Signal: {json.dumps({k: v for k, v in signal.items() if k != 'twelve_data'}, indent=2)}\n"
+        f"Twelve Data: {json.dumps(twelve, indent=2)}\n"
         f"News: {json.dumps(news, indent=2)}\n"
         f"Macro: {json.dumps(macro, indent=2)}\n\n"
         f"Give ONE clear response explaining your reasoning.\n"
@@ -268,14 +376,28 @@ def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
 def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, gemini_out):
     if not CHATGPT_KEY:
         return "CHATGPT ERROR: No API key"
+    
+    twelve = signal.get("twelve_data", {})
+    
     prompt = (
         f"You are a SENIOR EXECUTION TRADER with deep market knowledge.\n\n"
         f"Analyze ALL of the following data sources:\n\n"
-        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal, indent=2)}\n\n"
+        f"1. TRADINGVIEW SIGNAL:\n{json.dumps({k: v for k, v in signal.items() if k != 'twelve_data'}, indent=2)}\n\n"
         f"2. LIVE NEWS (Finnhub):\n{json.dumps(news, indent=2)}\n\n"
         f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
-        f"4. GEMINI ANALYST VIEW:\n{gemini_out}\n\n"
-        f"5. YOUR OWN MARKET KNOWLEDGE:\n"
+        f"4. TWELVE DATA TECHNICAL INDICATORS (LIVE):\n"
+        f"   RSI: {twelve.get('rsi', 'N/A')}\n"
+        f"   MACD: {twelve.get('macd', 'N/A')} (Signal: {twelve.get('macd_signal', 'N/A')}, Histogram: {twelve.get('macd_histogram', 'N/A')})\n"
+        f"   Stochastic: K={twelve.get('stoch_k', 'N/A')}, D={twelve.get('stoch_d', 'N/A')}\n"
+        f"   CCI: {twelve.get('cci', 'N/A')}\n"
+        f"   MFI: {twelve.get('mfi', 'N/A')}\n"
+        f"   Williams %R: {twelve.get('willr', 'N/A')}\n"
+        f"   OBV: {twelve.get('obv', 'N/A')}\n"
+        f"   Aroon: Up={twelve.get('aroon_up', 'N/A')}, Down={twelve.get('aroon_down', 'N/A')}\n"
+        f"   Ichimoku: Conversion={twelve.get('ichimoku_conversion', 'N/A')}, Base={twelve.get('ichimoku_base', 'N/A')}, SpanA={twelve.get('ichimoku_span_a', 'N/A')}, SpanB={twelve.get('ichimoku_span_b', 'N/A')}\n"
+        f"   Parabolic SAR: {twelve.get('psar', 'N/A')}\n\n"
+        f"5. GEMINI ANALYST VIEW:\n{gemini_out}\n\n"
+        f"6. YOUR OWN MARKET KNOWLEDGE:\n"
         f"   SYMBOL: {symbol}\n"
         f"   CURRENT PRICE: {price}\n"
         f"   TIMEFRAME: {timeframe}\n"
@@ -372,6 +494,9 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
                   chatgpt_challenge_msg, gemini_defense):
     if not CHATGPT_KEY:
         return "CHATGPT ERROR: No API key"
+    
+    twelve = signal.get("twelve_data", {})
+    
     prompt = (
         f"You are a SENIOR EXECUTION TRADER making the ABSOLUTE FINAL decision.\n\n"
         f"SYMBOL: {symbol}\n"
@@ -381,7 +506,8 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
         f"Gemini original analysis:\n{gemini_first}\n\n"
         f"Your challenge to Gemini:\n{chatgpt_challenge_msg}\n\n"
         f"Gemini defense:\n{gemini_defense}\n\n"
-        f"Original signal:\n{json.dumps(signal, indent=2)}\n\n"
+        f"Original signal:\n{json.dumps({k: v for k, v in signal.items() if k != 'twelve_data'}, indent=2)}\n\n"
+        f"Twelve Data indicators:\n{json.dumps(twelve, indent=2)}\n\n"
         f"You have heard both sides. Make the FINAL call.\n"
         f"No more discussion after this.\n\n"
         f"STRICT RULES:\n"
@@ -492,18 +618,41 @@ def webhook():
             f"Validator: {validator}\n"
             f"Confidence: {confidence}\n"
             f"---------------------------\n"
-            f"Fetching live news and macro..."
+            f"Fetching live news, macro and technical data..."
         )
 
         # STEP 3 — Fetch live data
         news  = fetch_finnhub(symbol)
         macro = fetch_gdelt()
+        
+        # STEP 3.5 — Fetch Twelve Data indicators (10 indicators)
+        twelve_data = fetch_twelve_data(symbol)
+        
+        # Merge Twelve Data into the main data dict
+        data["twelve_data"] = twelve_data
+
+        # Create summary of Twelve Data for Telegram
+        twelve_summary = ""
+        if twelve_data:
+            twelve_summary = (
+                f"Twelve Data Fetched:\n"
+                f"RSI: {twelve_data.get('rsi', 'N/A')}\n"
+                f"MACD: {twelve_data.get('macd', 'N/A')}\n"
+                f"Stoch K/D: {twelve_data.get('stoch_k', 'N/A')}/{twelve_data.get('stoch_d', 'N/A')}\n"
+                f"MFI: {twelve_data.get('mfi', 'N/A')}\n"
+                f"Williams %R: {twelve_data.get('willr', 'N/A')}\n"
+                f"Aroon Up/Down: {twelve_data.get('aroon_up', 'N/A')}/{twelve_data.get('aroon_down', 'N/A')}\n"
+                f"PSAR: {twelve_data.get('psar', 'N/A')}\n"
+            )
+        else:
+            twelve_summary = "Twelve Data: No API key or fetch failed"
 
         send_telegram(
             f"LIVE DATA FETCHED\n"
             f"---------------------------\n"
             f"News Sentiment: {news['sentiment']}\n"
             f"Macro Risk: {macro['risk']}\n"
+            f"{twelve_summary}\n"
             f"---------------------------\n"
             f"Running Gemini analysis..."
         )
