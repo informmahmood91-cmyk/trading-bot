@@ -91,13 +91,14 @@ def reset_day():
     today = datetime.now(timezone.utc).date()
     if current_day != today:
         current_day = today
-        pair_session_tracker = {}
+        pair_session_tracker = {}  # Clear all trades
         print(f"Day reset: {today}")
-
-
 # ==========================================
 # TIME BASED SESSION DETECTION
 # ==========================================
+# Store trades with timestamps instead of just True
+pair_session_tracker = {}  # Format: {key: [timestamp1, timestamp2]}
+
 def get_session_by_time():
     now_utc = datetime.now(timezone.utc)
     pk_hour = (now_utc.hour + 5) % 24
@@ -110,20 +111,51 @@ def get_session_by_time():
 
 
 def session_gate(symbol):
+    global pair_session_tracker
     reset_day()
     session = get_session_by_time()
+    
     if session == "off":
         return False, "Outside trading sessions", session
+    
     key = f"{symbol}_{session}"
-    if key in pair_session_tracker:
-        return False, f"Already traded {symbol} in {session} today", session
+    now = datetime.now(timezone.utc)
+    
+    # Get existing timestamps for this symbol/session
+    timestamps = pair_session_tracker.get(key, [])
+    
+    # Check if already has 2 trades
+    if len(timestamps) >= 2:
+        return False, f"Already traded {symbol} 2 times in {session} today", session
+    
+    # Check if last trade was within 1 hour (3600 seconds)
+    if len(timestamps) == 1:
+        last_trade_time = timestamps[0]
+        time_diff = (now - last_trade_time).total_seconds()
+        if time_diff < 3600:
+            remaining = int(3600 - time_diff)
+            return False, f"Last trade {symbol} in {session} was {remaining} seconds ago. Need 1 hour gap", session
+    
     return True, "OK", session
 
 
 def register_trade(symbol, session):
-    pair_session_tracker[f"{symbol}_{session}"] = True
-    print(f"Trade registered: {symbol} {session}")
-
+    global pair_session_tracker
+    key = f"{symbol}_{session}"
+    now = datetime.now(timezone.utc)
+    
+    # Get existing timestamps
+    timestamps = pair_session_tracker.get(key, [])
+    
+    # Add new timestamp
+    timestamps.append(now)
+    
+    # Keep only last 2 timestamps
+    if len(timestamps) > 2:
+        timestamps = timestamps[-2:]
+    
+    pair_session_tracker[key] = timestamps
+    print(f"Trade registered: {symbol} {session} at {now}. Total trades: {len(timestamps)}/2")
 
 # ==========================================
 # FINNHUB — SYMBOL SPECIFIC NEWS (UPGRADE 1)
