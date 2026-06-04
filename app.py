@@ -716,12 +716,10 @@ def webhook():
             return "No data received", 400
 
         # Extract fields
-ctrlsymbol    = safe_str(data.get("symbol") or data.get("ticker"), "Unknown")
-price     = safe_float(data.get("price") or data.get("close") or 0)
-timeframe = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
-
-# ⚠️ FORCE 1H — Your Pine Script runs on 1H chart regardless of alert interval
-timeframe = "1H"
+        symbol    = safe_str(data.get("symbol") or data.get("ticker"), "Unknown")
+        price     = safe_float(data.get("price") or data.get("close") or 0)
+        timeframe = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
+        # ⚠️ FORCE 1H — Your Pine Script runs on 1H chart regardless of alert interval timeframe = "1H"
         direction  = safe_str(data.get("direction"), "Unknown")
         score      = safe_str(data.get("score"), "N/A")
         adx        = safe_str(data.get("adx"), "N/A")
@@ -752,25 +750,25 @@ timeframe = "1H"
 
         # STEP 2 — Signal notification
         send_telegram(
-    f"NEW SIGNAL RECEIVED\n"
-    f"---------------------------\n"
-    f"Symbol: {symbol}\n"
-    f"Price: {price}\n"
-    f"Direction: {direction}\n"
-    f"Score: {score}/100\n"
-    f"EA Score: {signal_ea}/8\n"
-    f"Timeframe: 1H (chart) | Alert: {raw_tf}\n"
-    f"Session: {session}\n"
-    f"ADX: {adx}\n"
-    f"ATR: {atr}\n"
-    f"Structure: {structure}\n"
-    f"EMA 21/50/200: {ema_21} / {ema_50} / {ema_200}\n"
-    f"Volume Ratio: {volume}\n"
-    f"Validator: {validator}\n"
-    f"Confidence: {confidence}\n"
-    f"---------------------------\n"
-    f"Fetching live news, macro and indicators..."
-)
+            f"NEW SIGNAL RECEIVED\n"
+            f"---------------------------\n"
+            f"Symbol: {symbol}\n"
+            f"Price: {price}\n"
+            f"Direction: {direction}\n"
+            f"Score: {score}/100\n"
+            f"EA Score: {signal_ea}/8\n"
+            f"Timeframe: 1H (chart) | Alert: {raw_tf}\n"
+            f"Session: {session}\n"
+            f"ADX: {adx}\n"
+            f"ATR: {atr}\n"
+            f"Structure: {structure}\n"
+            f"EMA 21/50/200: {ema_21} / {ema_50} / {ema_200}\n"
+            f"Volume Ratio: {volume}\n"
+            f"Validator: {validator}\n"
+            f"Confidence: {confidence}\n"
+            f"---------------------------\n"
+            f"Fetching live news, macro and indicators..."
+        )
 
         # STEP 3 — Fetch all live data
         news     = fetch_finnhub(symbol)
