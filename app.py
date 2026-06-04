@@ -676,6 +676,7 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
     except Exception as e:
         return f"CHATGPT FINAL ERROR: {str(e)}"
 
+
 def extract_neutral_reason(gemini_text, chatgpt_text, calendar):
     """Extract 2-5 word reason for NEUTRAL decision"""
     combined = (gemini_text + " " + chatgpt_text).lower()
@@ -708,7 +709,8 @@ def extract_neutral_reason(gemini_text, chatgpt_text, calendar):
         return "Tech vs fund"
     
     return "No clear edge"
-    
+
+
 # ==========================================
 # WEBHOOK
 # ==========================================
@@ -849,7 +851,7 @@ def webhook():
             )
             send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
             send_telegram(f"FINAL DECISION (CHATGPT ONLY)\n---------------------------\n{chatgpt}")
-            # FIX 3: Only register trade if direction is BUY/SELL (not NEUTRAL)
+            # Only register trade if direction is BUY/SELL (not NEUTRAL)
             if "BUY" in chatgpt.upper() or "SELL" in chatgpt.upper():
                 register_trade(symbol, session)
             return "OK", 200
@@ -914,27 +916,31 @@ def webhook():
             else:
                 final_direction = "NEUTRAL"
 
-        send_telegram(final_message)
-
-        # STEP 8 — Register trade ONLY if final direction is BUY or SELL (not NEUTRAL)
+        # For BUY/SELL, send full analysis
+        if final_direction != "NEUTRAL":
+            send_telegram(final_message)
+            register_trade(symbol, session)
+            return "OK", 200
+        
+        # For NEUTRAL, send compact one-line message
         if final_direction == "NEUTRAL":
-           # Extract confidence
-           conf = "N/A"
-           if "CONFIDENCE:" in chatgpt:
-               import re
-               match = re.search(r'CONFIDENCE:\s*(\d+)', chatgpt)
-               if match:
-                  conf = match.group(1) + "%"
-    
-          # Extract short reason
-          reason = extract_neutral_reason(gemini, chatgpt, calendar)
-    
-          # Send ONE line
-          send_telegram(f"⚪ NEUTRAL | {symbol} | {conf} | {reason}")
-    
-         # Do NOT register trade
-         # Do NOT send full analysis
-         return "OK", 200
+            # Extract confidence
+            conf = "N/A"
+            if "CONFIDENCE:" in chatgpt:
+                import re
+                match = re.search(r'CONFIDENCE:\s*(\d+)', chatgpt)
+                if match:
+                    conf = match.group(1) + "%"
+            
+            # Extract short reason
+            reason = extract_neutral_reason(gemini, chatgpt, calendar)
+            
+            # Send ONE line
+            send_telegram(f"⚪ NEUTRAL | {symbol} | {conf} | {reason}")
+            
+            # Do NOT register trade
+            # Do NOT send full analysis
+            return "OK", 200
 
     except Exception as e:
         error_msg = f"ERROR: {str(e)[:200]}"
