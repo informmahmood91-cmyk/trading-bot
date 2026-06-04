@@ -68,6 +68,19 @@ def safe_int(v):
         return 0
 
 
+def clean_symbol(symbol):
+    """Remove broker/exchange prefixes from symbol"""
+    prefixes = [
+        "FX:", "OANDA:", "BINANCE:", "PYTH:",
+        "TVC:", "CAPITALCOM:", "PEPPERSTONE:",
+        "ICMARKETS:", "FXCM:", "FOREX:"
+    ]
+    s = symbol.upper().strip()
+    for prefix in prefixes:
+        s = s.replace(prefix, "")
+    return s.strip()
+
+
 def parse_incoming_data(request_json, request_text):
     if request_json and isinstance(request_json, dict):
         print(f"Parsed as JSON: {request_json}")
@@ -113,41 +126,53 @@ def session_gate(symbol):
     global pair_session_tracker
     reset_day()
     session = get_session_by_time()
-    
+
+    # 24hr assets bypass session time restriction
+    symbol_clean = clean_symbol(symbol)
+    if symbol_clean in ALWAYS_ON_SYMBOLS:
+        session = "24hr"
+        key = f"{symbol_clean}_24hr"
+        now = datetime.now(timezone.utc)
+        timestamps = pair_session_tracker.get(key, [])
+        if len(timestamps) >= 2:
+            return False, f"Already traded {symbol_clean} 2 times today", session
+        if len(timestamps) == 1:
+            time_diff = (now - timestamps[0]).total_seconds()
+            if time_diff < 3600:
+                remaining = int(3600 - time_diff)
+                return False, f"Last trade {symbol_clean} was {remaining} seconds ago. Need 1 hour gap", session
+        return True, "OK", session
+
     if session == "off":
         return False, "Outside trading sessions", session
-    
-    key = f"{symbol}_{session}"
+
+    key = f"{symbol_clean}_{session}"
     now = datetime.now(timezone.utc)
-    
     timestamps = pair_session_tracker.get(key, [])
-    
+
     if len(timestamps) >= 2:
-        return False, f"Already traded {symbol} 2 times in {session} today", session
-    
+        return False, f"Already traded {symbol_clean} 2 times in {session} today", session
+
     if len(timestamps) == 1:
-        last_trade_time = timestamps[0]
-        time_diff = (now - last_trade_time).total_seconds()
+        time_diff = (now - timestamps[0]).total_seconds()
         if time_diff < 3600:
             remaining = int(3600 - time_diff)
-            return False, f"Last trade {symbol} in {session} was {remaining} seconds ago. Need 1 hour gap", session
-    
+            return False, f"Last trade {symbol_clean} in {session} was {remaining} seconds ago. Need 1 hour gap", session
+
     return True, "OK", session
 
 
 def register_trade(symbol, session):
     global pair_session_tracker
-    key = f"{symbol}_{session}"
+    symbol_clean = clean_symbol(symbol)
+    key = f"{symbol_clean}_{session}"
     now = datetime.now(timezone.utc)
-    
     timestamps = pair_session_tracker.get(key, [])
     timestamps.append(now)
-    
     if len(timestamps) > 2:
         timestamps = timestamps[-2:]
-    
     pair_session_tracker[key] = timestamps
-    print(f"Trade registered: {symbol} {session} at {now}. Total trades: {len(timestamps)}/2")
+    print(f"Trade registered: {symbol_clean} {session} at {now}. Total: {len(timestamps)}/2")
 
 
 # ==========================================
@@ -157,7 +182,7 @@ def fetch_finnhub(symbol):
     if not FINNHUB_KEY:
         return {"sentiment": "NEUTRAL", "text": "No Finnhub key", "headlines": []}
 
-    symbol = symbol.upper().replace("FX:", "").replace("OANDA:", "").replace("BINANCE:", "").strip()
+    symbol = clean_symbol(symbol)
 
     SYMBOL_KEYWORDS = {
         "EURUSD": ["EUR", "Euro", "ECB", "European"],
@@ -170,9 +195,21 @@ def fetch_finnhub(symbol):
         "GBPJPY": ["GBP", "Pound", "JPY", "Yen", "BOE", "BOJ"],
         "EURJPY": ["EUR", "Euro", "JPY", "Yen", "ECB", "BOJ"],
         "EURGBP": ["EUR", "Euro", "GBP", "Pound", "ECB", "BOE"],
+        "GBPCHF": ["GBP", "Pound", "CHF", "Franc"],
+        "AUDCAD": ["AUD", "Aussie", "CAD", "Canada"],
+        "CADJPY": ["CAD", "Canada", "JPY", "Yen"],
+        "CHFJPY": ["CHF", "Swiss", "JPY", "Yen"],
         "XAUUSD": ["Gold", "XAU", "bullion", "precious metals", "Fed"],
-        "USOIL": ["Oil", "WTI", "crude", "OPEC", "energy"],
+        "GOLD":   ["Gold", "XAU", "bullion", "precious metals"],
+        "XAGUSD": ["Silver", "XAG", "precious metals"],
+        "USOIL":  ["Oil", "WTI", "crude", "OPEC", "energy"],
+        "UKOIL":  ["Oil", "Brent", "crude", "OPEC", "energy"],
         "BTCUSD": ["Bitcoin", "BTC", "crypto"],
+        "BTCUSDT":["Bitcoin", "BTC", "crypto"],
+        "ETHUSD": ["Ethereum", "ETH", "crypto"],
+        "US30":   ["Dow Jones", "DJIA", "Wall Street"],
+        "NAS100": ["Nasdaq", "tech stocks", "S&P"],
+        "SPX500": ["S&P 500", "SPX", "Wall Street"],
     }
 
     keywords = SYMBOL_KEYWORDS.get(symbol, [])
@@ -194,12 +231,15 @@ def fetch_finnhub(symbol):
                 matched_headlines.append(headline)
 
         if not matched_headlines:
+            print(f"No symbol specific news for {symbol} — using general news")
             matched_headlines = [n.get("headline", "") for n in all_news[:5]]
 
         text = " ".join(matched_headlines).lower()
         bull = sum(w in text for w in ["rise", "bull", "gain", "up", "growth", "hawkish", "strong"])
         bear = sum(w in text for w in ["fall", "bear", "drop", "crash", "recession", "dovish", "weak"])
         sentiment = "POSITIVE" if bull > bear else "NEGATIVE" if bear > bull else "NEUTRAL"
+
+        print(f"Finnhub: {symbol} | Keywords: {keywords} | Headlines: {len(matched_headlines)} | Sentiment: {sentiment}")
 
         return {
             "sentiment": sentiment,
@@ -227,9 +267,9 @@ def fetch_economic_calendar():
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         events = r.json().get("economicCalendar", [])
-
         high_impact = [e for e in events if e.get("impact") == "high"]
 
+        print(f"Economic calendar: {len(high_impact)} high impact events")
         return {
             "high_impact_soon": len(high_impact) > 0,
             "events": [e.get("event", "") for e in high_impact[:3]]
@@ -254,6 +294,7 @@ def fetch_gdelt():
             if any(w in a.get("title", "").lower() for w in risk_words):
                 score += 1
         risk = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
+        print(f"GDELT macro risk: {risk}")
         return {"risk": risk, "score": score}
     except Exception as e:
         print(f"GDELT error: {e}")
@@ -261,11 +302,14 @@ def fetch_gdelt():
 
 
 # ==========================================
-# TWELVE DATA — TECHNICAL INDICATORS
+# TWELVE DATA — 10 TECHNICAL INDICATORS
 # ==========================================
 def fetch_twelve_data(symbol):
     if not TWELVE_DATA_KEY:
+        print("Twelve Data: No API key")
         return {}
+
+    symbol = clean_symbol(symbol)
 
     if "/" not in symbol and len(symbol) == 6:
         symbol = f"{symbol[:3]}/{symbol[3:]}"
@@ -274,16 +318,16 @@ def fetch_twelve_data(symbol):
     api_key = TWELVE_DATA_KEY
 
     indicators = {
-        "rsi": f"{base_url}/rsi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
-        "macd": f"{base_url}/macd?symbol={symbol}&interval=1h&apikey={api_key}",
-        "stoch": f"{base_url}/stoch?symbol={symbol}&interval=1h&apikey={api_key}",
-        "cci": f"{base_url}/cci?symbol={symbol}&interval=1h&time_period=20&apikey={api_key}",
-        "mfi": f"{base_url}/mfi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
-        "willr": f"{base_url}/willr?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
-        "obv": f"{base_url}/obv?symbol={symbol}&interval=1h&apikey={api_key}",
-        "aroon": f"{base_url}/aroon?symbol={symbol}&interval=1h&time_period=25&apikey={api_key}",
+        "rsi":      f"{base_url}/rsi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        "macd":     f"{base_url}/macd?symbol={symbol}&interval=1h&apikey={api_key}",
+        "stoch":    f"{base_url}/stoch?symbol={symbol}&interval=1h&apikey={api_key}",
+        "cci":      f"{base_url}/cci?symbol={symbol}&interval=1h&time_period=20&apikey={api_key}",
+        "mfi":      f"{base_url}/mfi?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        "willr":    f"{base_url}/willr?symbol={symbol}&interval=1h&time_period=14&apikey={api_key}",
+        "obv":      f"{base_url}/obv?symbol={symbol}&interval=1h&apikey={api_key}",
+        "aroon":    f"{base_url}/aroon?symbol={symbol}&interval=1h&time_period=25&apikey={api_key}",
         "ichimoku": f"{base_url}/ichimoku?symbol={symbol}&interval=1h&apikey={api_key}",
-        "psar": f"{base_url}/psar?symbol={symbol}&interval=1h&apikey={api_key}",
+        "psar":     f"{base_url}/psar?symbol={symbol}&interval=1h&apikey={api_key}",
     }
 
     results = {}
@@ -299,7 +343,7 @@ def fetch_twelve_data(symbol):
         except Exception as e:
             print(f"Twelve Data {name} error: {e}")
             results[name] = "N/A"
-        time.sleep(0.1)
+        time.sleep(8)
 
     return {
         "rsi": results.get("rsi", {}).get("rsi", "N/A") if isinstance(results.get("rsi"), dict) else results.get("rsi", "N/A"),
@@ -323,13 +367,13 @@ def fetch_twelve_data(symbol):
 
 
 # ==========================================
-# GEMINI — FULL ANALYSIS
+# GEMINI — FULL ANALYSIS (WITH RETRY)
 # ==========================================
 def gemini_analysis(signal, news, macro):
     if not GEMINI_KEY:
         return "GEMINI UNAVAILABLE: No API key"
 
-    twelve = signal.get("twelve_data", {})
+    twelve   = signal.get("twelve_data", {})
     calendar = signal.get("calendar", {})
     signal_clean = {k: v for k, v in signal.items() if k not in ["twelve_data", "calendar"]}
 
@@ -340,14 +384,14 @@ def gemini_analysis(signal, news, macro):
     prompt = (
         f"You are a professional MARKET ANALYST with deep knowledge of global markets.\n\n"
         f"Analyze ALL of the following data sources together:\n\n"
-        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal_clean, indent=2)}\n\n"
+        f"1. TRADINGVIEW SIGNAL (H1 CHART):\n{json.dumps(signal_clean, indent=2)}\n\n"
         f"2. LIVE NEWS (Finnhub — Symbol Specific):\n"
         f"   Sentiment: {news.get('sentiment', 'N/A')}\n"
         f"   Headlines: {json.dumps(news.get('headlines', []), indent=2)}\n\n"
         f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
         f"4. ECONOMIC CALENDAR:\n"
         f"   {cal_warning if cal_warning else 'No high impact events today'}\n\n"
-        f"5. TWELVE DATA LIVE TECHNICAL INDICATORS:\n"
+        f"5. TWELVE DATA LIVE TECHNICAL INDICATORS (1H TIMEFRAME):\n"
         f"   RSI: {twelve.get('rsi', 'N/A')}\n"
         f"   MACD: {twelve.get('macd', 'N/A')} | Signal: {twelve.get('macd_signal', 'N/A')} | Histogram: {twelve.get('macd_histogram', 'N/A')}\n"
         f"   Stochastic K/D: {twelve.get('stoch_k', 'N/A')} / {twelve.get('stoch_d', 'N/A')}\n"
@@ -362,6 +406,7 @@ def gemini_analysis(signal, news, macro):
         f"6. YOUR OWN MARKET KNOWLEDGE:\n"
         f"   - Use your knowledge of this asset, current trends, correlations\n"
         f"   - Consider interest rates, geopolitical factors, market sentiment\n\n"
+        f"IMPORTANT: This is an H1 (1 Hour) chart signal. All analysis must be based on H1 timeframe.\n\n"
         f"TECHNICAL OVERRIDE RULES:\n"
         f"- If structure_bias is BEAR and direction is SHORT — do NOT recommend BUY\n"
         f"- If structure_bias is BULL and direction is LONG — do NOT recommend SELL\n"
@@ -371,14 +416,15 @@ def gemini_analysis(signal, news, macro):
         f"- If HIGH IMPACT EVENT is imminent — recommend NEUTRAL regardless of signal\n\n"
         f"STRICT RULES:\n"
         f"- Combine all 6 sources into one decision\n"
-        f"- Never leave any field blank\n\n"
+        f"- Never leave any field blank\n"
+        f"- Never mention 10 minute or any timeframe other than H1\n\n"
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"CONFIDENCE: [0-100%]\n"
         f"NEWS IMPACT: [POSITIVE/NEGATIVE/NEUTRAL]\n"
         f"MACRO RISK: [HIGH/MEDIUM/LOW]\n"
         f"CALENDAR WARNING: [YES/NO — any high impact events]\n"
-        f"TECHNICAL VIEW: [comment on RSI, MACD, Stochastic, structure and EMA alignment]\n"
+        f"TECHNICAL VIEW: [comment on RSI, MACD, Stochastic, structure and EMA alignment on H1]\n"
         f"FUNDAMENTAL VIEW: [interest rate policy, central bank stance, economic factors]\n"
         f"REASON: [2-3 sentences combining all sources]"
     )
@@ -403,7 +449,7 @@ def gemini_analysis(signal, news, macro):
 
 
 # ==========================================
-# GEMINI — DEFEND POSITION
+# GEMINI — DEFEND POSITION (WITH RETRY)
 # ==========================================
 def gemini_defend(signal, news, macro, gemini_first, chatgpt_question):
     if not GEMINI_KEY:
@@ -467,14 +513,14 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
     prompt = (
         f"You are a SENIOR EXECUTION TRADER with deep market knowledge.\n\n"
         f"Analyze ALL of the following data sources:\n\n"
-        f"1. TRADINGVIEW SIGNAL:\n{json.dumps(signal_clean, indent=2)}\n\n"
+        f"1. TRADINGVIEW SIGNAL (H1 CHART):\n{json.dumps(signal_clean, indent=2)}\n\n"
         f"2. LIVE NEWS (Finnhub — Symbol Specific):\n"
         f"   Sentiment: {news.get('sentiment', 'N/A')}\n"
         f"   Headlines: {json.dumps(news.get('headlines', []), indent=2)}\n\n"
         f"3. MACRO RISK (GDELT):\n{json.dumps(macro, indent=2)}\n\n"
         f"4. ECONOMIC CALENDAR:\n"
         f"   {cal_warning if cal_warning else 'No high impact events today'}\n\n"
-        f"5. TWELVE DATA LIVE TECHNICAL INDICATORS:\n"
+        f"5. TWELVE DATA LIVE TECHNICAL INDICATORS (1H TIMEFRAME):\n"
         f"   RSI: {twelve.get('rsi', 'N/A')}\n"
         f"   MACD: {twelve.get('macd', 'N/A')} | Signal: {twelve.get('macd_signal', 'N/A')} | Histogram: {twelve.get('macd_histogram', 'N/A')}\n"
         f"   Stochastic K/D: {twelve.get('stoch_k', 'N/A')} / {twelve.get('stoch_d', 'N/A')}\n"
@@ -490,9 +536,10 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
         f"7. YOUR OWN MARKET KNOWLEDGE:\n"
         f"   SYMBOL: {symbol}\n"
         f"   CURRENT PRICE: {price}\n"
-        f"   TIMEFRAME: {timeframe}\n"
+        f"   TIMEFRAME: H1\n"
         f"   Use your own knowledge of this asset, interest rates,\n"
         f"   correlations, market structure and sentiment\n\n"
+        f"IMPORTANT: This is an H1 (1 Hour) chart signal. All analysis must be based on H1 timeframe.\n\n"
         f"TECHNICAL OVERRIDE RULES:\n"
         f"- If structure_bias is BEAR and direction is SHORT — do NOT recommend BUY\n"
         f"- If structure_bias is BULL and direction is LONG — do NOT recommend SELL\n"
@@ -507,7 +554,8 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
         f"- If BUY: SL below price, TP above price\n"
         f"- If SELL: SL above price, TP below price\n"
         f"- Use ATR value from signal for SL/TP sizing if available\n"
-        f"- Never write Unknown or blank\n\n"
+        f"- Never write Unknown or blank\n"
+        f"- Never mention 10 minute or any timeframe other than H1\n\n"
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"AGREEMENT WITH GEMINI: [YES/NO]\n"
@@ -516,7 +564,7 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
         f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
         f"CONFIDENCE: [0-100%]\n"
-        f"OWN REASONING: [2-3 sentences from your own analysis]\n"
+        f"OWN REASONING: [2-3 sentences from your own analysis on H1]\n"
         f"GEMINI COMPARISON: [1 sentence on why you agree or disagree]"
     )
     try:
@@ -592,7 +640,8 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
     prompt = (
         f"You are a SENIOR EXECUTION TRADER making the ABSOLUTE FINAL decision.\n\n"
         f"SYMBOL: {symbol}\n"
-        f"PRICE: {price}\n\n"
+        f"PRICE: {price}\n"
+        f"TIMEFRAME: H1\n\n"
         f"Your original analysis:\n{chatgpt_view}\n\n"
         f"Gemini original analysis:\n{gemini_first}\n\n"
         f"Your challenge to Gemini:\n{chatgpt_challenge_msg}\n\n"
@@ -620,7 +669,7 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
         f"TAKE PROFIT: [number only]\n"
         f"RISK:REWARD: [1:X]\n"
         f"CONFIDENCE: [0-100%]\n"
-        f"WHY THIS DECISION: [2-3 sentences final reasoning]"
+        f"WHY THIS DECISION: [2-3 sentences final reasoning on H1]"
     )
     try:
         r = requests.post(
@@ -665,15 +714,17 @@ def webhook():
             return "No data received", 400
 
         # Extract fields
-        symbol    = safe_str(data.get("symbol") or data.get("ticker"), "Unknown")
-        price     = safe_float(data.get("price") or data.get("close") or 0)
-        
-        # Get raw timeframe from TradingView (alert interval)
-        raw_tf = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
-        
-        # FORCE 1H - Your Pine Script runs on H1 chart regardless of alert interval
-        timeframe = "1H"
-        
+        symbol     = clean_symbol(safe_str(data.get("symbol") or data.get("ticker"), "Unknown"))
+        price      = safe_float(data.get("price") or data.get("close") or 0)
+        raw_tf     = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
+
+        # FORCE 1H — Pine Script runs on H1 chart regardless of alert interval
+        timeframe  = "1H"
+
+        # Override tf in data so AI sees correct timeframe
+        data["tf"]       = "1H"
+        data["timeframe"] = "1H"
+
         direction  = safe_str(data.get("direction"), "Unknown")
         score      = safe_str(data.get("score"), "N/A")
         adx        = safe_str(data.get("adx"), "N/A")
@@ -688,7 +739,7 @@ def webhook():
         signal_score = safe_int(data.get("score") or 0)
         signal_ea    = safe_int(data.get("ea_score") or data.get("ea_filter") or 0)
 
-        print(f"Symbol: {symbol} | Price: {price} | Score: {signal_score} | EA: {signal_ea} | Alert TF: {raw_tf} | Using TF: {timeframe}")
+        print(f"Symbol: {symbol} | Price: {price} | Score: {signal_score} | EA: {signal_ea} | Alert TF: {raw_tf} | Using: 1H")
 
         # STEP 1 — Session gate
         allowed, reason, session = session_gate(symbol)
@@ -711,7 +762,7 @@ def webhook():
             f"Direction: {direction}\n"
             f"Score: {score}/100\n"
             f"EA Score: {signal_ea}/8\n"
-            f"Timeframe: {timeframe} (chart) | Alert: {raw_tf}\n"
+            f"Timeframe: 1H (chart) | Alert: {raw_tf}\n"
             f"Session: {session}\n"
             f"ADX: {adx}\n"
             f"ATR: {atr}\n"
@@ -749,7 +800,6 @@ def webhook():
         else:
             twelve_summary = "Twelve Data: No API key or unavailable"
 
-        # Calendar warning
         cal_warning = ""
         if calendar.get("high_impact_soon"):
             events_list = ", ".join(calendar.get("events", []))
@@ -763,7 +813,7 @@ def webhook():
             f"Macro Risk: {macro['risk']}\n"
             f"{cal_warning}"
             f"---------------------------\n"
-            f"TWELVE DATA INDICATORS:\n"
+            f"TWELVE DATA INDICATORS (1H):\n"
             f"{twelve_summary}\n"
             f"---------------------------\n"
             f"Running Gemini analysis..."
