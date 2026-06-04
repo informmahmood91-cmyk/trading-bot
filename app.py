@@ -483,7 +483,7 @@ def get_session_by_time():
     pk_hour = (now_utc.hour + 5) % 24
     if 12 <= pk_hour < 18:
         return "london"
-    elif 18 <= pk_hour or pk_hour < 2:
+    elif 18 <= pk_hour or pk_hour <= 2:
         return "newyork"
     else:
         return "off"
@@ -1204,9 +1204,18 @@ def webhook():
         # ══════════════════════════════════════════════════════════════
         allowed, gate_reason, session = session_gate(symbol)
         if not allowed:
-            # Silent block — no telegram noise for routine blocks
-            print(f"BLOCKED: {symbol} | {gate_reason}")
-            return "Blocked", 200
+        # Send notification for blocked signals
+          send_telegram(
+             f"🚫 SIGNAL BLOCKED | {symbol} | {session.upper() if session != 'off' else 'OFF'}\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+             f"Price:      {price}\n"
+             f"Direction:  {direction}\n"
+             f"Score:      {score}/100\n"
+             f"EA Filter:  {signal_ea}/8\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+             f"Reason: {gate_reason}"
+        )
+        return "Blocked", 200
 
         # ── Signal received ──────────────────────────────────────────
         send_telegram(
