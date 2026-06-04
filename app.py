@@ -140,24 +140,10 @@ def session_gate(symbol):
 
     if len(timestamps) == 1:
         time_diff = (now - timestamps[0]).total_seconds()
-        if time_diff < 3600:
-            remaining = int(3600 - time_diff)
-            return False, f"Last trade {symbol_clean} in {session} was {remaining} seconds ago. Need 1 hour gap", session
-
-    return True, "OK", session
-
-    key = f"{symbol_clean}_{session}"
-    now = datetime.now(timezone.utc)
-    timestamps = pair_session_tracker.get(key, [])
-
-    if len(timestamps) >= 2:
-        return False, f"Already traded {symbol_clean} 2 times in {session} today", session
-
-    if len(timestamps) == 1:
-        time_diff = (now - timestamps[0]).total_seconds()
-        if time_diff < 3600:
-            remaining = int(3600 - time_diff)
-            return False, f"Last trade {symbol_clean} in {session} was {remaining} seconds ago. Need 1 hour gap", session
+        # FIX 2: Changed from 3600 (1 hour) to 7200 (2 hours)
+        if time_diff < 7200:
+            remaining = int(7200 - time_diff)
+            return False, f"Last trade {symbol_clean} in {session} was {remaining} seconds ago. Need 2 hour gap", session
 
     return True, "OK", session
 
@@ -343,7 +329,8 @@ def fetch_twelve_data(symbol):
         except Exception as e:
             print(f"Twelve Data {name} error: {e}")
             results[name] = "N/A"
-        time.sleep(8)
+        # FIX 1: Changed from 8 seconds to 0.5 seconds for balance of speed and reliability
+        time.sleep(0.5)
 
     return {
         "rsi": results.get("rsi", {}).get("rsi", "N/A") if isinstance(results.get("rsi"), dict) else results.get("rsi", "N/A"),
@@ -548,9 +535,8 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
         f"- Only recommend NEUTRAL if technical and fundamental are completely opposite\n"
         f"- If HIGH IMPACT EVENT is imminent — recommend NEUTRAL regardless of signal\n\n"
         f"STRICT RULES:\n"
-        f"- ENTRY must be exactly: {price}\n"
-        f"- STOP LOSS must be calculated from {price}\n"
-        f"- TAKE PROFIT must be calculated from {price}\n"
+        f"- If DIRECTION is NEUTRAL: ENTRY, STOP LOSS, TAKE PROFIT, RISK:REWARD must be 'N/A'\n"
+        f"- If DIRECTION is BUY or SELL: ENTRY must be exactly {price}, SL and TP must be calculated\n"
         f"- If BUY: SL below price, TP above price\n"
         f"- If SELL: SL above price, TP below price\n"
         f"- Use ATR value from signal for SL/TP sizing if available\n"
@@ -559,10 +545,10 @@ def chatgpt_analysis(symbol, price, timeframe, signal, news, macro, calendar, ge
         f"Output EXACTLY:\n"
         f"DIRECTION: [BUY/SELL/NEUTRAL]\n"
         f"AGREEMENT WITH GEMINI: [YES/NO]\n"
-        f"ENTRY: {price}\n"
-        f"STOP LOSS: [number only]\n"
-        f"TAKE PROFIT: [number only]\n"
-        f"RISK:REWARD: [1:X]\n"
+        f"ENTRY: {price} if BUY/SELL, else 'N/A'\n"
+        f"STOP LOSS: [number only] if BUY/SELL, else 'N/A'\n"
+        f"TAKE PROFIT: [number only] if BUY/SELL, else 'N/A'\n"
+        f"RISK:REWARD: [1:X] if BUY/SELL, else 'N/A'\n"
         f"CONFIDENCE: [0-100%]\n"
         f"OWN REASONING: [2-3 sentences from your own analysis on H1]\n"
         f"GEMINI COMPARISON: [1 sentence on why you agree or disagree]"
@@ -655,19 +641,18 @@ def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_first,
         f"- If structure_bias is BULL and direction is LONG — do NOT recommend SELL\n"
         f"- Technical signal is PRIMARY — news and fundamentals are SUPPORTING only\n\n"
         f"STRICT RULES:\n"
-        f"- ENTRY must be exactly: {price}\n"
-        f"- STOP LOSS must be a real number from {price}\n"
-        f"- TAKE PROFIT must be a real number from {price}\n"
+        f"- If FINAL DIRECTION is NEUTRAL: ENTRY, STOP LOSS, TAKE PROFIT, RISK:REWARD must be 'N/A'\n"
+        f"- If FINAL DIRECTION is BUY or SELL: ENTRY must be exactly {price}, SL and TP must be calculated\n"
         f"- If BUY: SL below price, TP above price\n"
         f"- If SELL: SL above price, TP below price\n"
         f"- Use ATR from signal for SL/TP sizing if available\n"
         f"- Never write Unknown or blank\n\n"
         f"Output EXACTLY:\n"
         f"FINAL DIRECTION: [BUY/SELL/NEUTRAL]\n"
-        f"ENTRY: {price}\n"
-        f"STOP LOSS: [number only]\n"
-        f"TAKE PROFIT: [number only]\n"
-        f"RISK:REWARD: [1:X]\n"
+        f"ENTRY: {price} if BUY/SELL, else 'N/A'\n"
+        f"STOP LOSS: [number only] if BUY/SELL, else 'N/A'\n"
+        f"TAKE PROFIT: [number only] if BUY/SELL, else 'N/A'\n"
+        f"RISK:REWARD: [1:X] if BUY/SELL, else 'N/A'\n"
         f"CONFIDENCE: [0-100%]\n"
         f"WHY THIS DECISION: [2-3 sentences final reasoning on H1]"
     )
@@ -832,7 +817,9 @@ def webhook():
             )
             send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
             send_telegram(f"FINAL DECISION (CHATGPT ONLY)\n---------------------------\n{chatgpt}")
-            register_trade(symbol, session)
+            # FIX 3: Only register trade if direction is BUY/SELL (not NEUTRAL)
+            if "BUY" in chatgpt.upper() or "SELL" in chatgpt.upper():
+                register_trade(symbol, session)
             return "OK", 200
 
         # STEP 6 — ChatGPT full analysis
@@ -842,7 +829,7 @@ def webhook():
         )
         send_telegram(f"CHATGPT ANALYSIS:\n---------------------------\n{chatgpt}")
 
-        # STEP 7 — Agreement check
+        # STEP 7 — Agreement check and determine final direction
         gemini_buy      = "buy" in gemini.lower()
         gemini_sell     = "sell" in gemini.lower()
         gemini_neutral  = "neutral" in gemini.lower()
@@ -850,19 +837,20 @@ def webhook():
         chatgpt_sell    = "sell" in chatgpt.lower()
         chatgpt_neutral = "neutral" in chatgpt.lower()
 
+        # Determine final direction for trade registration
+        final_direction = "NEUTRAL"
+        final_message = ""
+
         if gemini_neutral or chatgpt_neutral:
-            send_telegram(
-                f"FINAL DECISION (CHATGPT ONLY — NEUTRAL DETECTED)\n"
-                f"---------------------------\n"
-                f"{chatgpt}"
-            )
+            final_message = f"FINAL DECISION (CHATGPT ONLY — NEUTRAL DETECTED)\n---------------------------\n{chatgpt}"
+            final_direction = "NEUTRAL"
 
         elif (gemini_buy and chatgpt_buy) or (gemini_sell and chatgpt_sell):
-            send_telegram(
-                f"FINAL DECISION (BOTH AGREED)\n"
-                f"---------------------------\n"
-                f"{chatgpt}"
-            )
+            final_message = f"FINAL DECISION (BOTH AGREED)\n---------------------------\n{chatgpt}"
+            if gemini_buy and chatgpt_buy:
+                final_direction = "BUY"
+            elif gemini_sell and chatgpt_sell:
+                final_direction = "SELL"
 
         else:
             send_telegram("Disagreement detected. ChatGPT challenging Gemini...")
@@ -886,14 +874,22 @@ def webhook():
                 chatgpt, gemini,
                 challenge, gemini_reply
             )
-            send_telegram(
-                f"FINAL DECISION (CHATGPT AFTER DEBATE)\n"
-                f"---------------------------\n"
-                f"{final}"
-            )
+            final_message = f"FINAL DECISION (CHATGPT AFTER DEBATE)\n---------------------------\n{final}"
+            if "BUY" in final.upper():
+                final_direction = "BUY"
+            elif "SELL" in final.upper():
+                final_direction = "SELL"
+            else:
+                final_direction = "NEUTRAL"
 
-        # STEP 8 — Register trade
-        register_trade(symbol, session)
+        send_telegram(final_message)
+
+        # STEP 8 — Register trade ONLY if final direction is BUY or SELL (not NEUTRAL)
+        if final_direction != "NEUTRAL":
+            register_trade(symbol, session)
+            send_telegram(f"✅ Trade registered: {symbol} in {session} ({final_direction})")
+        else:
+            send_telegram(f"⚠️ NEUTRAL signal — NOT counted toward 2/session limit for {symbol}")
 
         return "OK", 200
 
