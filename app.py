@@ -127,24 +127,24 @@ def session_gate(symbol):
     reset_day()
     session = get_session_by_time()
 
-    # 24hr assets bypass session time restriction
-    symbol_clean = clean_symbol(symbol)
-    if symbol_clean in ALWAYS_ON_SYMBOLS:
-        session = "24hr"
-        key = f"{symbol_clean}_24hr"
-        now = datetime.now(timezone.utc)
-        timestamps = pair_session_tracker.get(key, [])
-        if len(timestamps) >= 2:
-            return False, f"Already traded {symbol_clean} 2 times today", session
-        if len(timestamps) == 1:
-            time_diff = (now - timestamps[0]).total_seconds()
-            if time_diff < 3600:
-                remaining = int(3600 - time_diff)
-                return False, f"Last trade {symbol_clean} was {remaining} seconds ago. Need 1 hour gap", session
-        return True, "OK", session
-
     if session == "off":
         return False, "Outside trading sessions", session
+
+    symbol_clean = clean_symbol(symbol)
+    key = f"{symbol_clean}_{session}"
+    now = datetime.now(timezone.utc)
+    timestamps = pair_session_tracker.get(key, [])
+
+    if len(timestamps) >= 2:
+        return False, f"Already traded {symbol_clean} 2 times in {session} today", session
+
+    if len(timestamps) == 1:
+        time_diff = (now - timestamps[0]).total_seconds()
+        if time_diff < 3600:
+            remaining = int(3600 - time_diff)
+            return False, f"Last trade {symbol_clean} in {session} was {remaining} seconds ago. Need 1 hour gap", session
+
+    return True, "OK", session
 
     key = f"{symbol_clean}_{session}"
     now = datetime.now(timezone.utc)
