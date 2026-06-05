@@ -6,6 +6,7 @@ import requests
 from flask import Flask, request
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -30,6 +31,33 @@ OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 # ==========================================
 pair_session_tracker = {}
 current_day = None
+
+# ==========================================
+# OFF-SESSION SIGNAL BUFFER
+# ==========================================
+# Stores qualifying signals (score>=80, EA>=4) received during
+# off-session hours (PKT 02:00 – 12:00).
+# Structure per symbol key:
+# {
+#   "signals": [
+#       {"direction": str, "score": int, "ea": int,
+#        "price": float, "timestamp": datetime},
+#       ...
+#   ],
+#   "last_alert_sent":      datetime or None,
+#   "last_alert_direction": str or None
+# }
+off_session_buffer = {}
+
+# ── Off-session tunable thresholds ────────────────────────
+# Minimum qualifying signals before consistency is evaluated
+OFF_MIN_SIGNALS = 3
+
+# % of signals that must share same direction to fire alert
+OFF_CONSISTENCY_PCT = 0.80
+
+# Minutes between repeat alerts for same symbol+direction
+OFF_ALERT_COOLDOWN_MINUTES = 60
 
 # ==========================================
 # NEUTRAL SIGNAL CACHE
@@ -463,6 +491,298 @@ def reset_auto_streak(symbol, session):
 
 
 # ==========================================
+# OFF-SESSION BUFFER — CORE FUNCTIONS
+# ==========================================
+
+def store_off_session_signal(symbol, direction, score, ea, price):
+    """
+    Stores a qualifying signal in the off-session buffer.
+    Only called during off-session hours for signals that already
+    passed Pine Script score/EA thresholds.
+    No pruning — buffer covers full overnight window (02:00–12:00).
+    """
+    key = clean_symbol(symbol)
+    now = datetime.now(timezone.utc)
+
+    if key not in off_session_buffer:
+        off_session_buffer[key] = {
+            "signals":              [],
+            "last_alert_sent":      None,
+            "last_alert_direction": None
+        }
+
+    off_session_buffer[key]["signals"].append({
+        "direction": direction.upper().replace("LONG", "BUY").replace("SHORT", "SELL"),
+        "score":     int(score),
+        "ea":        int(ea),
+        "price":     float(price),
+        "timestamp": now
+    })
+
+    total = len(off_session_buffer[key]["signals"])
+    print(f"OFF-SESSION [{key}]: stored signal #{total} | {direction} | score={score} ea={ea}")
+
+
+def _build_conviction_bar(pct):
+    """Returns a 10-block progress bar string for consistency %."""
+    filled = round(pct / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _conviction_label(consistency, avg_score, total):
+    """Returns STRONG / MODERATE / WEAK based on thresholds."""
+    if consistency >= 0.80 and avg_score >= 85 and total >= 10:
+        return "STRONG"
+    if (consistency >= 0.80 and avg_score >= 80 and total >= 8) or \
+       (consistency >= 0.70 and avg_score >= 85):
+        return "MODERATE"
+    return "WEAK"
+
+
+def _build_pair_line(key, signals, mode):
+    """
+    Builds the formatted block for one pair.
+    mode: "short" (9 AM) or "full" (11:59 AM)
+    Returns formatted string or None if insufficient data.
+    """
+    total = len(signals)
+    if total == 0:
+        return None
+
+    # Count directions
+    buys  = sum(1 for s in signals if s["direction"] == "BUY")
+    sells = sum(1 for s in signals if s["direction"] == "SELL")
+
+    if total < 2:
+        if mode == "full":
+            return (
+                f"⚪ {key:<8} —  LOW DATA\n"
+                f"   {total} signal only — insufficient for assessment\n"
+                f"   Treat as cold pair at open\n"
+            )
+        return None
+
+    dominant_dir   = "BUY" if buys >= sells else "SELL"
+    dominant_count = max(buys, sells)
+    consistency    = dominant_count / total
+    emoji          = "🟢" if dominant_dir == "BUY" else "🔴"
+
+    # Mixed check
+    if consistency < 0.60:
+        if mode == "short":
+            return None  # skip mixed pairs in short mode
+        scores    = [s["score"] for s in signals]
+        avg_score = round(sum(scores) / len(scores), 1)
+        prices    = [s["price"] for s in signals]
+        return (
+            f"⚪ {key:<8} —  MIXED\n"
+            f"   {buys} BUY / {sells} SELL  |  Score avg {avg_score}\n"
+            f"   Range: {min(prices):.5f} – {max(prices):.5f}\n"
+            f"   ▸ No dominant direction — wait for open\n"
+        )
+
+    scores    = [s["score"] for s in signals]
+    avg_score = round(sum(scores) / len(scores), 1)
+    max_score = max(scores)
+    min_score = min(scores)
+    prices    = [s["price"] for s in signals]
+    bar       = _build_conviction_bar(consistency * 100)
+    pct_str   = f"{round(consistency * 100, 1)}%"
+    conviction = _conviction_label(consistency, avg_score, total)
+
+    first_price = signals[0]["price"]
+    last_price  = signals[-1]["price"]
+    delta       = last_price - first_price
+    delta_str   = f"+{delta:.5f}" if delta >= 0 else f"{delta:.5f}"
+
+    if mode == "short":
+        return (
+            f"{emoji} {key:<8} {dominant_dir}  {bar}  {pct_str}\n"
+            f"   {total} signals | Score {avg_score} avg | EA {round(sum(s['ea'] for s in signals)/total,1)}\n"
+            f"   {first_price:.5f} → {last_price:.5f}  ({delta_str})\n"
+        )
+    else:
+        ea_avg    = round(sum(s["ea"] for s in signals) / total, 1)
+        span_mins = int((signals[-1]["timestamp"] - signals[0]["timestamp"]).total_seconds() / 60)
+
+        lines = [
+            f"{emoji} {key}  —  {dominant_dir}  {bar}  {pct_str}\n",
+            f"   {total} signals  |  {dominant_count} {dominant_dir}  {total - dominant_count} {'SELL' if dominant_dir == 'BUY' else 'BUY'}\n",
+            f"   Score:   {min_score} – {max_score}  (avg {avg_score})\n",
+            f"   EA:      avg {ea_avg}\n",
+            f"   Open:    {first_price:.5f}\n",
+            f"   Current: {last_price:.5f}\n",
+            f"   Move:    {delta_str}  ({abs(delta/first_price*100):.2f}%)\n",
+            f"   High:    {max(prices):.5f}  |  Low: {min(prices):.5f}\n",
+        ]
+
+        # Conviction commentary
+        if conviction == "STRONG":
+            lines.append(f"   ▸ Consistent {dominant_dir} pressure all night\n")
+            if dominant_dir == "SELL" and delta < 0:
+                lines.append(f"   ▸ Price declining through overnight range\n")
+            elif dominant_dir == "BUY" and delta > 0:
+                lines.append(f"   ▸ Price climbing steadily overnight\n")
+            lines.append(f"   ▸ STRONG conviction\n")
+        elif conviction == "MODERATE":
+            lines.append(f"   ▸ Moderate {dominant_dir} bias, some counter-signals\n")
+            lines.append(f"   ▸ Confirm structure on H1 before entry\n")
+            lines.append(f"   ▸ MODERATE conviction\n")
+        else:
+            lines.append(f"   ▸ Mild {dominant_dir} lean, inconsistent\n")
+            lines.append(f"   ▸ Wait for London confirmation before entry\n")
+            lines.append(f"   ▸ WEAK conviction\n")
+
+        return "".join(lines)
+
+
+def send_presession_snapshot(mode):
+    """
+    Sends the off-session accumulation snapshot to Telegram.
+    mode: "overnight" → 9 AM PKT short summary
+          "presession" → 11:59 AM PKT full pre-trade brief
+
+    Called by APScheduler — no signal required to trigger this.
+    """
+    now_utc  = datetime.now(timezone.utc)
+    now_pkt  = now_utc + timedelta(hours=5)
+    time_str = now_pkt.strftime("%I:%M %p PKT")
+
+    if mode == "overnight":
+        title    = f"🌙 OVERNIGHT WATCH | {time_str}"
+        period   = "02:00 – 09:00 PKT  (7 hours)"
+        msg_mode = "short"
+    else:
+        title    = f"🌅 PRE-SESSION BRIEF | {time_str}"
+        period   = "02:00 – 11:59 PKT  (10 hours)"
+        msg_mode = "full"
+
+    # Count total signals across all pairs
+    total_signals = sum(
+        len(v.get("signals", []))
+        for v in off_session_buffer.values()
+    )
+
+    # ── No signals at all ───────────────────────────────────
+    if total_signals == 0 or not off_session_buffer:
+        if mode == "overnight":
+            send_telegram(
+                f"{title}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Period: {period}\n\n"
+                f"No qualifying signals received yet.\n"
+                f"All pairs below score/EA threshold.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ Next update: 11:59 AM (London open)"
+            )
+        else:
+            send_telegram(
+                f"{title}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Period: {period}\n\n"
+                f"No qualifying signals overnight.\n"
+                f"All pairs below score/EA threshold.\n\n"
+                f"Market likely ranging or low volatility.\n"
+                f"Wait for London session to establish direction.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            off_session_buffer.clear()
+        return
+
+    # ── Build pair blocks ───────────────────────────────────
+    pair_blocks   = []
+    watch_pairs   = []   # STRONG + MODERATE only — for WATCH section (full mode)
+    mixed_blocks  = []
+
+    for key, data in off_session_buffer.items():
+        signals = data.get("signals", [])
+        if not signals:
+            continue
+
+        block = _build_pair_line(key, signals, msg_mode)
+        if block is None:
+            continue
+
+        # Separate mixed from directional for full mode ordering
+        if "MIXED" in block or "LOW DATA" in block:
+            mixed_blocks.append(block)
+        else:
+            pair_blocks.append(block)
+
+            # Determine if watch-worthy (full mode only)
+            if msg_mode == "full":
+                buys  = sum(1 for s in signals if s["direction"] == "BUY")
+                sells = sum(1 for s in signals if s["direction"] == "SELL")
+                total = len(signals)
+                dom   = max(buys, sells)
+                cons  = dom / total if total > 0 else 0
+                dir_  = "BUY" if buys >= sells else "SELL"
+                scores = [s["score"] for s in signals]
+                avg_s  = sum(scores) / len(scores) if scores else 0
+                conv   = _conviction_label(cons, avg_s, total)
+                if conv in ("STRONG", "MODERATE") and cons >= 0.80:
+                    emoji = "🟢" if dir_ == "BUY" else "🔴"
+                    watch_pairs.append(f"   {emoji} {key} {dir_} — {conv.lower()} overnight build")
+
+    # ── Assemble message ────────────────────────────────────
+    header = (
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Period: {period}\n"
+        f"Signals: {total_signals} qualified across {len(off_session_buffer)} pairs\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    body = "\n".join(pair_blocks)
+    if mixed_blocks and msg_mode == "full":
+        body += "\n" + "\n".join(mixed_blocks)
+
+    # Footer
+    if mode == "overnight":
+        footer = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ Next update: 11:59 AM (London open)"
+        )
+    else:
+        # Watch list
+        watch_section = ""
+        if watch_pairs:
+            watch_section = (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 WATCH AT OPEN:\n"
+                + "\n".join(watch_pairs) + "\n"
+            )
+
+        # Calendar warning
+        calendar_section = ""
+        try:
+            cal = fetch_economic_calendar()
+            if cal.get("high_impact_soon"):
+                events_str = ", ".join(cal.get("events", []))
+                calendar_section = (
+                    f"\n⚠️ HIGH IMPACT TODAY:\n"
+                    f"   {events_str}\n"
+                    f"   Trade conservatively — consider waiting post-release\n"
+                )
+        except Exception:
+            pass
+
+        footer = (
+            f"{watch_section}"
+            f"{calendar_section}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Good luck. Session starting now.\n"
+            f"Buffer cleared."
+        )
+
+        # Clear buffer after 11:59 AM send
+        off_session_buffer.clear()
+
+    send_telegram(header + body + footer)
+    print(f"Pre-session snapshot sent: mode={mode} | signals={total_signals}")
+
+
+# ==========================================
 # DAILY RESET
 # ==========================================
 def reset_day():
@@ -483,7 +803,7 @@ def get_session_by_time():
     pk_hour = (now_utc.hour + 5) % 24
     if 12 <= pk_hour < 18:
         return "london"
-    elif 18 <= pk_hour or pk_hour <= 2:
+    elif 18 <= pk_hour or pk_hour < 2:
         return "newyork"
     else:
         return "off"
@@ -1204,18 +1524,30 @@ def webhook():
         # ══════════════════════════════════════════════════════════════
         allowed, gate_reason, session = session_gate(symbol)
         if not allowed:
-        # Send notification for blocked signals
-          send_telegram(
-             f"🚫 SIGNAL BLOCKED | {symbol} | {session.upper() if session != 'off' else 'OFF'}\n"
-             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-             f"Price:      {price}\n"
-             f"Direction:  {direction}\n"
-             f"Score:      {score}/100\n"
-             f"EA Filter:  {signal_ea}/8\n"
-             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-             f"Reason: {gate_reason}"
-        )
-        return "Blocked", 200
+            if session == "off":
+                # ── OFF-SESSION: accumulate qualifying signals silently ──
+                # Pine Script already enforced score/EA thresholds before
+                # firing the alert — no additional filtering needed here.
+                store_off_session_signal(
+                    symbol, direction,
+                    safe_int(data.get("score") or 0),
+                    signal_ea, price
+                )
+                # Individual off-session signals are always silent —
+                # summaries are sent at 09:00 and 11:59 by the scheduler.
+            else:
+                # Session cooldown or trade limit — send notification
+                send_telegram(
+                    f"🚫 SIGNAL BLOCKED | {symbol} | {session.upper()}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Price:      {price}\n"
+                    f"Direction:  {direction}\n"
+                    f"Score:      {score}/100\n"
+                    f"EA Filter:  {signal_ea}/8\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Reason: {gate_reason}"
+                )
+            return "Blocked", 200
 
         # ── Signal received ──────────────────────────────────────────
         send_telegram(
@@ -1553,5 +1885,27 @@ def root():
 
 
 if __name__ == "__main__":
+    # ── Off-session snapshot scheduler ──────────────────────
+    # Fires two fixed-time summaries daily in PKT (UTC+5):
+    #   09:00 PKT → overnight short summary  (UTC 04:00)
+    #   11:59 PKT → pre-session full brief   (UTC 06:59)
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(
+        send_presession_snapshot,
+        "cron",
+        hour=4, minute=0,        # 09:00 PKT = 04:00 UTC
+        args=["overnight"],
+        id="overnight_snapshot"
+    )
+    scheduler.add_job(
+        send_presession_snapshot,
+        "cron",
+        hour=6, minute=59,       # 11:59 PKT = 06:59 UTC
+        args=["presession"],
+        id="presession_brief"
+    )
+    scheduler.start()
+    print("Scheduler started: snapshots at 09:00 and 11:59 PKT daily")
+
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
