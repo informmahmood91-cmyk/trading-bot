@@ -1,7 +1,34 @@
+"""
+MIKA TRADING BOT — FINAL VERSION
+=================================
+Architecture:
+  Gate 1   → Session & frequency check
+  Gate 2   → Parallel data fetch (Finnhub + GDELT + Calendar)
+  Gate 2.5 → Currency-specific calendar hard block
+  Gate 3   → Twelve Data fetch (7 core indicators)
+  Gate 3.5 → MCS auto-neutral filter
+  Gate 4   → Blind parallel AI Round 1 (Gemini + ChatGPT)
+             Both receive: data context + chart image (vision)
+             Both independently analyse: patterns, BOS, CHoCH,
+             structure, indicators, pivots, auction, news
+  Gate 5   → ChatGPT decides: agree / debate / neutral
+  Gate 6   → If debate: challenge → defend → final verdict
+  Gate 7   → ATR-based SL/TP calculation (Python, not AI)
+  Gate 8   → SL/TP sanity validation
+
+Chart Vision:
+  Pine Script includes chart_url in alert JSON.
+  Bot fetches, converts to base64, sends to both AIs.
+  AIs identify: BOS, CHoCH, double top/bottom, wedges,
+  trend lines, rejection wicks, liquidity grabs, etc.
+"""
+
 import json
 import os
 import re
 import time
+import threading
+import base64
 import requests
 from flask import Flask, request
 from datetime import datetime, timezone, timedelta
@@ -19,74 +46,38 @@ CHATGPT_KEY      = os.environ.get("CHATGPT_KEY")
 GEMINI_KEY       = os.environ.get("GEMINI_KEY")
 FINNHUB_KEY      = os.environ.get("FINNHUB_KEY")
 TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
+ENABLE_WEB_SEARCH = os.environ.get("ENABLE_WEB_SEARCH", "true").lower() == "true"
 
 # ==========================================
 # API ENDPOINTS
 # ==========================================
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
 
 # ==========================================
-# STATE CONTROL
+# STATE — THREAD-SAFE
 # ==========================================
 pair_session_tracker = {}
-current_day = None
+neutral_cache        = {}
+off_session_buffer   = {}
+current_day          = None
+
+trade_lock  = threading.Lock()
+cache_lock  = threading.Lock()
+buffer_lock = threading.Lock()
 
 # ==========================================
-# OFF-SESSION SIGNAL BUFFER
+# CONFIGURATION (env-tunable)
 # ==========================================
-# Stores qualifying signals (score>=80, EA>=4) received during
-# off-session hours (PKT 02:00 – 12:00).
-# Structure per symbol key:
-# {
-#   "signals": [
-#       {"direction": str, "score": int, "ea": int,
-#        "price": float, "timestamp": datetime},
-#       ...
-#   ],
-#   "last_alert_sent":      datetime or None,
-#   "last_alert_direction": str or None
-# }
-off_session_buffer = {}
-
-# ── Off-session tunable thresholds ────────────────────────
-# Minimum qualifying signals before consistency is evaluated
-OFF_MIN_SIGNALS = 3
-
-# % of signals that must share same direction to fire alert
-OFF_CONSISTENCY_PCT = 0.80
-
-# Minutes between repeat alerts for same symbol+direction
-OFF_ALERT_COOLDOWN_MINUTES = 60
-
-# ==========================================
-# NEUTRAL SIGNAL CACHE
-# ==========================================
-# Stores last signal snapshot per pair to enable
-# Market Change Score (MCS) calculation.
-# Structure per pair key:
-# {
-#   "last_outcome":   "NEUTRAL" / "BUY" / "SELL",
-#   "last_signal":    { price, rsi, macd_hist, stoch_k,
-#                       cci, mfi, willr, score, volume_ratio },
-#   "last_timestamp": datetime (UTC),
-#   "auto_count":     int  — how many times auto-neutral fired in a row
-# }
-neutral_cache = {}
-
-# ── Tunable thresholds ─────────────────────────────────
-# MCS below this → auto-neutral (skip AI entirely)
-MCS_THRESHOLD = 15.0
-
-# If price moves more than this % → always run AI
-PRICE_VETO_PCT = 0.30
-
-# Cached neutral expires after this many minutes → always run AI
-CACHE_EXPIRY_MINUTES = 30
-
-# Max consecutive auto-neutrals before forcing a real AI check
-# (prevents stale cache from suppressing a regime change)
-MAX_AUTO_NEUTRAL_STREAK = 4
+MCS_THRESHOLD            = float(os.environ.get("MCS_THRESHOLD",            "15.0"))
+PRICE_VETO_PCT           = float(os.environ.get("PRICE_VETO_PCT",           "0.30"))
+CACHE_EXPIRY_MINUTES     = int(os.environ.get("CACHE_EXPIRY_MINUTES",       "30"))
+MAX_AUTO_NEUTRAL_STREAK  = int(os.environ.get("MAX_AUTO_NEUTRAL_STREAK",    "4"))
+OFF_MIN_SIGNALS          = 3
+OFF_CONSISTENCY_PCT      = 0.80
+SL_ATR_MULTIPLIER        = float(os.environ.get("SL_ATR_MULTIPLIER",        "1.5"))
+TP_ATR_MULTIPLIER        = float(os.environ.get("TP_ATR_MULTIPLIER",        "2.5"))
+MIN_SL_DISTANCE_PCT      = 0.002   # 0.2% minimum SL distance
 
 
 # ==========================================
@@ -108,7 +99,6 @@ def send_telegram(msg):
             msg = msg[split_at:].lstrip("\n")
         if msg:
             chunks.append(msg)
-
     for chunk in chunks:
         try:
             requests.post(
@@ -130,13 +120,15 @@ def safe_str(v, default="N/A"):
         return default
     return str(v).strip()
 
-
-def safe_float(v):
+def safe_float(v, allow_zero=False):
+    """Returns float or None. Zero returns None unless allow_zero=True."""
     try:
-        return float(str(v).replace(",", "").strip())
+        f = float(str(v).replace(",", "").strip())
+        if f == 0.0 and not allow_zero:
+            return None
+        return f
     except Exception:
-        return 0.0
-
+        return None
 
 def safe_int(v):
     try:
@@ -144,754 +136,506 @@ def safe_int(v):
     except Exception:
         return 0
 
+def safe_bool(v):
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in ("true", "1", "yes")
 
 def clean_symbol(symbol):
-    prefixes = [
-        "FX:", "OANDA:", "BINANCE:", "PYTH:",
-        "TVC:", "CAPITALCOM:", "PEPPERSTONE:",
-        "ICMARKETS:", "FXCM:", "FOREX:"
-    ]
+    prefixes = ["FX:","OANDA:","BINANCE:","PYTH:","TVC:",
+                "CAPITALCOM:","PEPPERSTONE:","ICMARKETS:","FXCM:","FOREX:"]
     s = symbol.upper().strip()
-    for prefix in prefixes:
-        s = s.replace(prefix, "")
+    for p in prefixes:
+        s = s.replace(p, "")
     return s.strip()
 
-
-def parse_incoming_data(request_json, request_text):
-    if request_json and isinstance(request_json, dict):
-        print(f"Parsed as JSON: {request_json}")
-        return request_json
-    if request_text:
+def parse_incoming_data(rj, rt):
+    if rj and isinstance(rj, dict):
+        return rj
+    if rt:
         try:
-            parsed = json.loads(request_text.strip())
-            print(f"Raw text parsed: {parsed}")
-            return parsed
+            return json.loads(rt.strip())
         except Exception:
             pass
-    print(f"Could not parse: {request_text}")
     return {}
 
 
 # ==========================================
-# EXTRACTION HELPERS — UNIFIED REGEX
+# EXTRACTION HELPERS
 # ==========================================
 def extract_direction(text):
-    """
-    Extracts DIRECTION or FINAL DIRECTION from labeled line only.
-    Never does substring match — prevents 'do NOT BUY' false positives.
-    Returns: BUY / SELL / NEUTRAL
-    """
-    match = re.search(r'FINAL\s+DIRECTION\s*[:\-]\s*(BUY|SELL|NEUTRAL)', text.upper())
-    if match:
-        return match.group(1)
-    match = re.search(r'(?<!\w)DIRECTION\s*[:\-]\s*(BUY|SELL|NEUTRAL)', text.upper())
-    if match:
-        return match.group(1)
+    m = re.search(r'FINAL\s+DIRECTION\s*[:\-]\s*(BUY|SELL|NEUTRAL)', text.upper())
+    if m:
+        return m.group(1)
+    m = re.search(r'(?<!\w)DIRECTION\s*[:\-]\s*(BUY|SELL|NEUTRAL)', text.upper())
+    if m:
+        return m.group(1)
     return "NEUTRAL"
 
-
 def extract_confidence(text):
-    match = re.search(r'CONFIDENCE\s*[:\-]\s*(\d+)', text)
-    return match.group(1) + "%" if match else "N/A"
-
-
-def extract_sl(text):
-    match = re.search(r'STOP\s*LOSS\s*[:\-]\s*([\d.]+)', text, re.IGNORECASE)
-    return match.group(1) if match else "N/A"
-
-
-def extract_tp(text):
-    match = re.search(r'TAKE\s*PROFIT\s*[:\-]\s*([\d.]+)', text, re.IGNORECASE)
-    return match.group(1) if match else "N/A"
-
-
-def extract_rr(text):
-    match = re.search(r'RISK\s*[:\-/]?\s*REWARD\s*[:\-]\s*(1\s*[:/]\s*[\d.]+)', text, re.IGNORECASE)
-    return match.group(1).replace(" ", "") if match else "N/A"
-
-
-def extract_field(text, label):
-    """Extract single-line field value by label name."""
-    pattern = rf'{re.escape(label)}\s*[:\-]\s*(.+)'
-    match = re.search(pattern, text, re.IGNORECASE)
-    return match.group(1).strip() if match else "N/A"
-
+    m = re.search(r'CONFIDENCE\s*[:\-]\s*(\d+)', text)
+    return m.group(1) + "%" if m else "N/A"
 
 def extract_multiline_field(text, label):
-    """Extract field that may span multiple lines until next labeled field."""
-    pattern = rf'{re.escape(label)}\s*[:\-]\s*(.*?)(?=\n[A-Z ]+\s*[:\-]|\Z)'
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return match.group(1).strip().replace("\n", " ")
+    pattern = rf'{re.escape(label)}\s*[:\-]\s*(.*?)(?=\n[A-Z][A-Z ]*\s*[:\-]|\Z)'
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip().replace("\n", " ")[:400]
     return "N/A"
 
-
-# ==========================================
-# SL/TP SANITY VALIDATION
-# ==========================================
-def validate_levels(direction, price, sl, tp):
-    """
-    Validates SL and TP are on the correct side of entry.
-    Returns: (is_valid: bool, reason: str)
-    """
-    try:
-        sl_f = float(sl)
-        tp_f = float(tp)
-        pr_f = float(price)
-        if sl_f <= 0 or tp_f <= 0 or pr_f <= 0:
-            return False, "Zero or negative values"
-        if direction == "BUY":
-            if sl_f >= pr_f:
-                return False, f"BUY SL {sl_f} must be below entry {pr_f}"
-            if tp_f <= pr_f:
-                return False, f"BUY TP {tp_f} must be above entry {pr_f}"
-            return True, "OK"
-        elif direction == "SELL":
-            if sl_f <= pr_f:
-                return False, f"SELL SL {sl_f} must be above entry {pr_f}"
-            if tp_f >= pr_f:
-                return False, f"SELL TP {tp_f} must be below entry {pr_f}"
-            return True, "OK"
-    except (ValueError, TypeError) as e:
-        return False, f"Could not parse levels: {e}"
-    return False, "Unknown direction"
-
-
-# ==========================================
-# NEUTRAL REASON EXTRACTOR
-# ==========================================
-def extract_neutral_reason(text_a, text_b, calendar):
+def extract_neutral_reason(text_a, text_b, calendar, signal=None):
     combined = (text_a + " " + text_b).lower()
-    if calendar.get("high_impact_soon"):
-        events = calendar.get("events", [])
-        if events:
-            return f"{events[0].split()[0][:8]} event"
-        return "High impact event"
+    events   = calendar.get("events", [])
+    if calendar.get("high_impact_soon") and events:
+        first = events[0] if isinstance(events[0], str) else events[0].get("event","")
+        return f"{first.split()[0][:8]} event"
+    if signal:
+        if safe_bool(signal.get("lon_fail_up")) or safe_bool(signal.get("ny_fail_up")):
+            return "Failed bullish auction"
+        if safe_bool(signal.get("lon_fail_down")) or safe_bool(signal.get("ny_fail_down")):
+            return "Failed bearish auction"
+    if "double top" in combined or "double bottom" in combined:
+        return "Reversal pattern"
+    if "choch" in combined or "change of character" in combined:
+        return "CHoCH detected"
+    if "bos" in combined or "break of structure" in combined:
+        return "BOS conflict"
     if "technical conflict" in combined or "contradict" in combined:
         return "Tech conflict"
-    if "structure" in combined and "bear" in combined and "bull" in combined:
-        return "Structure conflict"
-    if "ranging" in combined:
+    if "pivot" in combined and ("r2" in combined or "s2" in combined):
+        return "At pivot extreme"
+    if "ranging" in combined or "adx" in combined and "low" in combined:
         return "Ranging market"
-    if "flat" in combined and "macd" in combined:
-        return "Flat momentum"
+    if "exhaustion" in combined or "overbought" in combined:
+        return "Momentum exhausted"
     if "opposite" in combined:
         return "Tech vs Fund"
     return "No clear edge"
 
 
 # ==========================================
-# MARKET CHANGE SCORE (MCS) ENGINE
+# ATR-BASED SL/TP CALCULATION (Python — not AI)
 # ==========================================
-
-def _pct_change(old, new):
+def calculate_sl_tp(direction, price, atr):
     """
-    Returns absolute % change between two values.
-    Returns 0.0 if either value is missing or non-numeric.
+    Deterministic SL/TP from ATR. AI does NOT calculate this.
+    SL = ATR × 1.5, TP = ATR × 2.5 → gives 1:1.67 minimum R:R
     """
     try:
-        o = float(old)
-        n = float(new)
-        if o == 0:
-            return 0.0
-        return abs((n - o) / o) * 100.0
+        pr = float(price)
+        if pr <= 0:
+            return "N/A", "N/A", "N/A"
+        atr_v = float(atr) if atr is not None else pr * 0.005
+        if atr_v <= 0:
+            atr_v = pr * 0.005
     except (TypeError, ValueError):
+        return "N/A", "N/A", "N/A"
+
+    if direction == "BUY":
+        sl = pr - (atr_v * SL_ATR_MULTIPLIER)
+        tp = pr + (atr_v * TP_ATR_MULTIPLIER)
+        min_dist = pr * MIN_SL_DISTANCE_PCT
+        if (pr - sl) < min_dist:
+            sl = pr - min_dist
+    elif direction == "SELL":
+        sl = pr + (atr_v * SL_ATR_MULTIPLIER)
+        tp = pr - (atr_v * TP_ATR_MULTIPLIER)
+        min_dist = pr * MIN_SL_DISTANCE_PCT
+        if (sl - pr) < min_dist:
+            sl = pr + min_dist
+    else:
+        return "N/A", "N/A", "N/A"
+
+    risk   = abs(pr - sl)
+    reward = abs(tp - pr)
+    rr     = f"1:{reward/risk:.1f}" if risk > 0 else "N/A"
+    return round(sl, 5), round(tp, 5), rr
+
+
+def validate_levels(direction, price, sl, tp):
+    try:
+        sl_f = float(sl); tp_f = float(tp); pr_f = float(price)
+        if direction == "BUY":
+            return sl_f < pr_f and tp_f > pr_f, f"BUY: SL{sl_f}<{pr_f}<TP{tp_f}"
+        if direction == "SELL":
+            return sl_f > pr_f and tp_f < pr_f, f"SELL: TP{tp_f}<{pr_f}<SL{sl_f}"
+    except Exception:
+        pass
+    return False, "Invalid levels"
+
+
+# ==========================================
+# MARKET REGIME DETECTION
+# ==========================================
+def detect_market_regime(adx, bb_width=None):
+    if adx is not None:
+        if adx > 25:
+            return "TRENDING"
+        if adx < 20:
+            return "RANGING"
+    if bb_width is not None:
+        try:
+            if float(bb_width) < 5:
+                return "COMPRESSION"
+        except Exception:
+            pass
+    return "TRANSITION"
+
+
+# ==========================================
+# CHART IMAGE FETCHER
+# ==========================================
+def fetch_chart_image(chart_url):
+    """
+    Fetches chart image from URL and converts to base64.
+    Supports: TradingView published chart URLs, direct image URLs.
+    Returns base64 string or None if failed.
+    """
+    if not chart_url or not isinstance(chart_url, str):
+        return None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)",
+            "Accept":     "image/png,image/jpeg,image/*"
+        }
+        r = requests.get(chart_url.strip(), headers=headers, timeout=15)
+        r.raise_for_status()
+        content_type = r.headers.get("content-type", "")
+        if "image" not in content_type and "octet-stream" not in content_type:
+            print(f"Chart URL returned non-image content: {content_type}")
+            return None
+        b64 = base64.b64encode(r.content).decode("utf-8")
+        print(f"Chart image fetched: {len(r.content)} bytes from {chart_url[:60]}")
+        return b64
+    except Exception as e:
+        print(f"Chart fetch error: {e}")
+        return None
+
+
+def get_image_mime(chart_url):
+    """Detect mime type from URL extension."""
+    url_lower = (chart_url or "").lower()
+    if ".jpg" in url_lower or ".jpeg" in url_lower:
+        return "image/jpeg"
+    if ".webp" in url_lower:
+        return "image/webp"
+    return "image/png"
+
+
+# ==========================================
+# MCS ENGINE
+# ==========================================
+def _pct_change(old, new):
+    try:
+        o = float(old); n = float(new)
+        return 0.0 if o == 0 else abs((n - o) / o) * 100.0
+    except Exception:
         return 0.0
 
+def _normalize(pct, scale):
+    return min((pct / scale) * 100.0, 100.0)
 
-def _normalize(pct_change, scale):
-    """
-    Maps a raw % change to a 0–100 score.
-    scale = the % change that represents "100% changed" for this indicator.
-    E.g. RSI scale=10 means a 10-point RSI move = score of 100.
-    Capped at 100.
-    """
-    return min((pct_change / scale) * 100.0, 100.0)
-
-
-def compute_mcs(prev_snapshot, curr_snapshot):
-    """
-    Computes a weighted Market Change Score (0–100) between
-    the previous signal snapshot and the current one.
-
-    Weights (must sum to 1.0):
-      price          0.25  — direct market movement
-      macd_histogram 0.20  — best momentum shift proxy
-      rsi            0.20  — momentum confirmation
-      score          0.15  — your engine's own assessment
-      stoch_k        0.10  — short-term momentum
-      volume_ratio   0.10  — institutional activity proxy
-
-    Scale values represent the % change that would score 100
-    for each indicator — tuned for H1 forex/commodities.
-    """
+def compute_mcs(prev, curr):
     components = [
-        # (field,            weight, scale)
-        ("price",            0.25,   0.30),   # 0.30% price move = full score
-        ("macd_histogram",   0.20,   50.0),   # 50% change in histogram
-        ("rsi",              0.20,   10.0),   # 10% RSI change
-        ("score",            0.15,   15.0),   # 15-point score shift
-        ("stoch_k",          0.10,   20.0),   # 20% stoch move
-        ("volume_ratio",     0.10,   30.0),   # 30% volume change
+        ("price",          0.25, 0.30),
+        ("macd_histogram", 0.20, 50.0),
+        ("rsi",            0.20, 10.0),
+        ("score",          0.15, 15.0),
+        ("stoch_k",        0.10, 20.0),
+        ("volume_ratio",   0.10, 30.0),
     ]
-
     mcs = 0.0
-    breakdown = {}
+    for field, w, scale in components:
+        ov = prev.get(field); nv = curr.get(field)
+        if ov is None or nv is None:
+            continue
+        mcs += _normalize(_pct_change(ov, nv), scale) * w
+    return round(mcs, 2)
 
-    for field, weight, scale in components:
-        old_val = prev_snapshot.get(field)
-        new_val = curr_snapshot.get(field)
-
-        if old_val is None or new_val is None:
-            # Missing data — treat as no change for that component
-            component_score = 0.0
-        else:
-            raw_pct  = _pct_change(old_val, new_val)
-            component_score = _normalize(raw_pct, scale) * weight
-
-        mcs += component_score
-        breakdown[field] = round(component_score / weight, 1) if weight > 0 else 0.0
-
-    return round(mcs, 2), breakdown
-
-
-def build_signal_snapshot(data, twelve_data):
-    """
-    Extracts the numeric values needed for MCS comparison
-    from the current incoming signal and Twelve Data output.
-    Returns a flat dict of floats (None if unavailable).
-    """
+def build_signal_snapshot(data, twelve):
     def _f(v):
         try:
-            return float(str(v).replace(",", "").strip())
-        except (TypeError, ValueError):
+            return float(str(v).replace(",","").strip())
+        except Exception:
             return None
-
     return {
         "price":          _f(data.get("price") or data.get("close")),
-        "rsi":            _f(twelve_data.get("rsi")),
-        "macd_histogram": _f(twelve_data.get("macd_histogram")),
-        "stoch_k":        _f(twelve_data.get("stoch_k")),
-        "cci":            _f(twelve_data.get("cci")),
-        "mfi":            _f(twelve_data.get("mfi")),
-        "willr":          _f(twelve_data.get("willr")),
+        "rsi":            _f(twelve.get("rsi")),
+        "macd_histogram": _f(twelve.get("macd_histogram")),
+        "stoch_k":        _f(twelve.get("stoch_k")),
         "score":          _f(data.get("score")),
         "volume_ratio":   _f(data.get("volume_ratio")),
     }
 
-
-def should_auto_neutral(symbol, session, data, twelve_data, calendar):
-    """
-    Master gate — decides whether to skip AI entirely and auto-neutral.
-
-    Returns: (skip: bool, reason: str, mcs: float)
-
-    skip=True  → fire auto-neutral, no AI calls
-    skip=False → run full AI pipeline
-
-    Veto conditions that ALWAYS force AI (skip=False):
-      V1. No cached neutral exists for this pair/session
-      V2. Last outcome was BUY or SELL (not neutral)
-      V3. Cache expired (> CACHE_EXPIRY_MINUTES old)
-      V4. High-impact calendar event detected
-      V5. Price moved > PRICE_VETO_PCT since last signal
-      V6. Auto-neutral streak >= MAX_AUTO_NEUTRAL_STREAK
-      V7. MCS >= MCS_THRESHOLD
-    """
+def should_auto_neutral(symbol, session, data, twelve, calendar):
     key = f"{clean_symbol(symbol)}_{session}"
-    cached = neutral_cache.get(key)
-
-    # V1 — No cache
+    with cache_lock:
+        cached = neutral_cache.get(key)
     if cached is None:
-        return False, "No cache — first signal", 0.0
-
-    # V2 — Last outcome was a trade
-    if cached.get("last_outcome") in ("BUY", "SELL"):
-        return False, "Last outcome was trade — re-evaluate", 0.0
-
-    # V3 — Cache expired
+        return False, "No cache", 0.0
+    if cached.get("last_outcome") in ("BUY","SELL"):
+        return False, "Last outcome was trade", 0.0
     last_ts = cached.get("last_timestamp")
     if last_ts:
-        age_minutes = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
-        if age_minutes > CACHE_EXPIRY_MINUTES:
-            return False, f"Cache expired ({age_minutes:.0f}m old)", 0.0
-
-    # V4 — High-impact calendar event
+        age = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+        if age > CACHE_EXPIRY_MINUTES:
+            return False, f"Cache expired ({age:.0f}m)", 0.0
     if calendar.get("high_impact_soon"):
-        events = ", ".join(calendar.get("events", []))
-        return False, f"High-impact event: {events}", 0.0
-
-    # V5 — Price veto
-    prev_snapshot = cached.get("last_signal", {})
-    curr_snapshot = build_signal_snapshot(data, twelve_data)
-    prev_price = prev_snapshot.get("price")
-    curr_price = curr_snapshot.get("price")
-
-    if prev_price and curr_price:
-        price_pct = _pct_change(prev_price, curr_price)
-        if price_pct >= PRICE_VETO_PCT:
-            return False, f"Price moved {price_pct:.3f}% — veto", price_pct
-
-    # V6 — Streak protection
-    streak = cached.get("auto_count", 0)
-    if streak >= MAX_AUTO_NEUTRAL_STREAK:
-        return False, f"Max streak ({streak}) reached — forced AI check", 0.0
-
-    # V7 — MCS threshold
-    mcs, breakdown = compute_mcs(prev_snapshot, curr_snapshot)
-    print(f"MCS for {symbol}: {mcs:.1f}% | breakdown: {breakdown}")
-
+        return False, "High-impact event", 0.0
+    prev = cached.get("last_signal", {})
+    curr = build_signal_snapshot(data, twelve)
+    pv   = prev.get("price"); cv = curr.get("price")
+    if pv and cv and _pct_change(pv, cv) >= PRICE_VETO_PCT:
+        return False, f"Price moved >{PRICE_VETO_PCT}%", 0.0
+    if cached.get("auto_count", 0) >= MAX_AUTO_NEUTRAL_STREAK:
+        return False, "Max streak reached", 0.0
+    mcs = compute_mcs(prev, curr)
     if mcs >= MCS_THRESHOLD:
-        return False, f"MCS {mcs:.1f}% >= threshold {MCS_THRESHOLD}% — run AI", mcs
+        return False, f"MCS {mcs:.1f}% >= {MCS_THRESHOLD}%", mcs
+    return True, f"MCS {mcs:.1f}% < {MCS_THRESHOLD}%", mcs
 
-    # All checks passed — auto-neutral is safe
-    return True, f"MCS {mcs:.1f}% < {MCS_THRESHOLD}% — auto-neutral", mcs
-
-
-def update_neutral_cache(symbol, session, outcome, data, twelve_data):
-    """
-    Updates the neutral cache after any pipeline completion.
-    Called for BOTH auto-neutrals and AI-evaluated neutrals.
-    outcome: "NEUTRAL" / "BUY" / "SELL"
-    """
-    key = f"{clean_symbol(symbol)}_{session}"
-    existing = neutral_cache.get(key, {})
-
-    snapshot = build_signal_snapshot(data, twelve_data)
-
-    if outcome == "NEUTRAL":
-        auto_count = existing.get("auto_count", 0)
-        # Only increment streak if this was an auto-neutral
-        # (tracked separately by caller)
-    else:
-        auto_count = 0  # Reset streak on any non-neutral outcome
-
-    neutral_cache[key] = {
-        "last_outcome":   outcome,
-        "last_signal":    snapshot,
-        "last_timestamp": datetime.now(timezone.utc),
-        "auto_count":     auto_count,
-    }
-    print(f"Cache updated: {key} | outcome={outcome} | streak={auto_count}")
-
-
-def increment_auto_streak(symbol, session):
-    """Increments the auto-neutral streak counter for a pair."""
-    key = f"{clean_symbol(symbol)}_{session}"
-    if key in neutral_cache:
-        neutral_cache[key]["auto_count"] = neutral_cache[key].get("auto_count", 0) + 1
-        print(f"Auto-neutral streak: {key} = {neutral_cache[key]['auto_count']}")
-
-
-def reset_auto_streak(symbol, session):
-    """Resets auto-neutral streak after a real AI check runs."""
-    key = f"{clean_symbol(symbol)}_{session}"
-    if key in neutral_cache:
-        neutral_cache[key]["auto_count"] = 0
-
-
-# ==========================================
-# OFF-SESSION BUFFER — CORE FUNCTIONS
-# ==========================================
-
-def store_off_session_signal(symbol, direction, score, ea, price):
-    """
-    Stores a qualifying signal in the off-session buffer.
-    Only called during off-session hours for signals that already
-    passed Pine Script score/EA thresholds.
-    No pruning — buffer covers full overnight window (02:00–12:00).
-    """
-    key = clean_symbol(symbol)
-    now = datetime.now(timezone.utc)
-
-    if key not in off_session_buffer:
-        off_session_buffer[key] = {
-            "signals":              [],
-            "last_alert_sent":      None,
-            "last_alert_direction": None
+def update_neutral_cache(symbol, session, outcome, data, twelve):
+    key  = f"{clean_symbol(symbol)}_{session}"
+    snap = build_signal_snapshot(data, twelve)
+    with cache_lock:
+        old        = neutral_cache.get(key, {})
+        auto_count = old.get("auto_count", 0) if outcome == "NEUTRAL" else 0
+        neutral_cache[key] = {
+            "last_outcome":   outcome,
+            "last_signal":    snap,
+            "last_timestamp": datetime.now(timezone.utc),
+            "auto_count":     auto_count,
         }
 
-    off_session_buffer[key]["signals"].append({
-        "direction": direction.upper().replace("LONG", "BUY").replace("SHORT", "SELL"),
-        "score":     int(score),
-        "ea":        int(ea),
-        "price":     float(price),
-        "timestamp": now
-    })
+def increment_auto_streak(symbol, session):
+    key = f"{clean_symbol(symbol)}_{session}"
+    with cache_lock:
+        if key in neutral_cache:
+            neutral_cache[key]["auto_count"] += 1
 
-    total = len(off_session_buffer[key]["signals"])
-    print(f"OFF-SESSION [{key}]: stored signal #{total} | {direction} | score={score} ea={ea}")
+def reset_auto_streak(symbol, session):
+    key = f"{clean_symbol(symbol)}_{session}"
+    with cache_lock:
+        if key in neutral_cache:
+            neutral_cache[key]["auto_count"] = 0
 
 
-def _build_conviction_bar(pct):
-    """Returns a 10-block progress bar string for consistency %."""
+# ==========================================
+# OFF-SESSION BUFFER
+# ==========================================
+def store_off_session_signal(symbol, direction, score, ea, price):
+    key = clean_symbol(symbol)
+    now = datetime.now(timezone.utc)
+    with buffer_lock:
+        if key not in off_session_buffer:
+            off_session_buffer[key] = {"signals": [], "last_alert_sent": None}
+        off_session_buffer[key]["signals"].append({
+            "direction": direction.upper().replace("LONG","BUY").replace("SHORT","SELL"),
+            "score": int(score), "ea": int(ea),
+            "price": float(price), "timestamp": now
+        })
+        print(f"OFF-SESSION [{key}]: {len(off_session_buffer[key]['signals'])} stored")
+
+def _conviction_bar(pct):
     filled = round(pct / 10)
     return "█" * filled + "░" * (10 - filled)
 
-
-def _conviction_label(consistency, avg_score, total):
-    """Returns STRONG / MODERATE / WEAK based on thresholds."""
-    if consistency >= 0.80 and avg_score >= 85 and total >= 10:
+def _conviction_label(cons, avg_score, total):
+    if cons >= 0.80 and avg_score >= 85 and total >= 10:
         return "STRONG"
-    if (consistency >= 0.80 and avg_score >= 80 and total >= 8) or \
-       (consistency >= 0.70 and avg_score >= 85):
+    if (cons >= 0.80 and avg_score >= 80 and total >= 8) or (cons >= 0.70 and avg_score >= 85):
         return "MODERATE"
     return "WEAK"
 
-
-def _build_pair_line(key, signals, mode):
-    """
-    Builds the formatted block for one pair.
-    mode: "short" (9 AM) or "full" (11:59 AM)
-    Returns formatted string or None if insufficient data.
-    """
-    total = len(signals)
-    if total == 0:
-        return None
-
-    # Count directions
-    buys  = sum(1 for s in signals if s["direction"] == "BUY")
-    sells = sum(1 for s in signals if s["direction"] == "SELL")
-
-    if total < 2:
-        if mode == "full":
-            return (
-                f"⚪ {key:<8} —  LOW DATA\n"
-                f"   {total} signal only — insufficient for assessment\n"
-                f"   Treat as cold pair at open\n"
-            )
-        return None
-
-    dominant_dir   = "BUY" if buys >= sells else "SELL"
-    dominant_count = max(buys, sells)
-    consistency    = dominant_count / total
-    emoji          = "🟢" if dominant_dir == "BUY" else "🔴"
-
-    # Mixed check
-    if consistency < 0.60:
-        if mode == "short":
-            return None  # skip mixed pairs in short mode
-        scores    = [s["score"] for s in signals]
-        avg_score = round(sum(scores) / len(scores), 1)
-        prices    = [s["price"] for s in signals]
-        return (
-            f"⚪ {key:<8} —  MIXED\n"
-            f"   {buys} BUY / {sells} SELL  |  Score avg {avg_score}\n"
-            f"   Range: {min(prices):.5f} – {max(prices):.5f}\n"
-            f"   ▸ No dominant direction — wait for open\n"
-        )
-
-    scores    = [s["score"] for s in signals]
-    avg_score = round(sum(scores) / len(scores), 1)
-    max_score = max(scores)
-    min_score = min(scores)
-    prices    = [s["price"] for s in signals]
-    bar       = _build_conviction_bar(consistency * 100)
-    pct_str   = f"{round(consistency * 100, 1)}%"
-    conviction = _conviction_label(consistency, avg_score, total)
-
-    first_price = signals[0]["price"]
-    last_price  = signals[-1]["price"]
-    delta       = last_price - first_price
-    delta_str   = f"+{delta:.5f}" if delta >= 0 else f"{delta:.5f}"
-
-    if mode == "short":
-        return (
-            f"{emoji} {key:<8} {dominant_dir}  {bar}  {pct_str}\n"
-            f"   {total} signals | Score {avg_score} avg | EA {round(sum(s['ea'] for s in signals)/total,1)}\n"
-            f"   {first_price:.5f} → {last_price:.5f}  ({delta_str})\n"
-        )
-    else:
-        ea_avg    = round(sum(s["ea"] for s in signals) / total, 1)
-        span_mins = int((signals[-1]["timestamp"] - signals[0]["timestamp"]).total_seconds() / 60)
-
-        lines = [
-            f"{emoji} {key}  —  {dominant_dir}  {bar}  {pct_str}\n",
-            f"   {total} signals  |  {dominant_count} {dominant_dir}  {total - dominant_count} {'SELL' if dominant_dir == 'BUY' else 'BUY'}\n",
-            f"   Score:   {min_score} – {max_score}  (avg {avg_score})\n",
-            f"   EA:      avg {ea_avg}\n",
-            f"   Open:    {first_price:.5f}\n",
-            f"   Current: {last_price:.5f}\n",
-            f"   Move:    {delta_str}  ({abs(delta/first_price*100):.2f}%)\n",
-            f"   High:    {max(prices):.5f}  |  Low: {min(prices):.5f}\n",
-        ]
-
-        # Conviction commentary
-        if conviction == "STRONG":
-            lines.append(f"   ▸ Consistent {dominant_dir} pressure all night\n")
-            if dominant_dir == "SELL" and delta < 0:
-                lines.append(f"   ▸ Price declining through overnight range\n")
-            elif dominant_dir == "BUY" and delta > 0:
-                lines.append(f"   ▸ Price climbing steadily overnight\n")
-            lines.append(f"   ▸ STRONG conviction\n")
-        elif conviction == "MODERATE":
-            lines.append(f"   ▸ Moderate {dominant_dir} bias, some counter-signals\n")
-            lines.append(f"   ▸ Confirm structure on H1 before entry\n")
-            lines.append(f"   ▸ MODERATE conviction\n")
-        else:
-            lines.append(f"   ▸ Mild {dominant_dir} lean, inconsistent\n")
-            lines.append(f"   ▸ Wait for London confirmation before entry\n")
-            lines.append(f"   ▸ WEAK conviction\n")
-
-        return "".join(lines)
-
-
 def send_presession_snapshot(mode):
-    """
-    Sends the off-session accumulation snapshot to Telegram.
-    mode: "overnight" → 9 AM PKT short summary
-          "presession" → 11:59 AM PKT full pre-trade brief
-
-    Called by APScheduler — no signal required to trigger this.
-    """
-    now_utc  = datetime.now(timezone.utc)
-    now_pkt  = now_utc + timedelta(hours=5)
+    now_pkt  = datetime.now(timezone.utc) + timedelta(hours=5)
     time_str = now_pkt.strftime("%I:%M %p PKT")
+    title    = "🌙 OVERNIGHT WATCH" if mode == "overnight" else "🌅 PRE-SESSION BRIEF"
+    period   = "02:00 – 09:00 PKT" if mode == "overnight" else "02:00 – 11:59 PKT"
 
-    if mode == "overnight":
-        title    = f"🌙 OVERNIGHT WATCH | {time_str}"
-        period   = "02:00 – 09:00 PKT  (7 hours)"
-        msg_mode = "short"
-    else:
-        title    = f"🌅 PRE-SESSION BRIEF | {time_str}"
-        period   = "02:00 – 11:59 PKT  (10 hours)"
-        msg_mode = "full"
-
-    # Count total signals across all pairs
-    total_signals = sum(
-        len(v.get("signals", []))
-        for v in off_session_buffer.values()
-    )
-
-    # ── No signals at all ───────────────────────────────────
-    if total_signals == 0 or not off_session_buffer:
-        if mode == "overnight":
-            send_telegram(
-                f"{title}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Period: {period}\n\n"
-                f"No qualifying signals received yet.\n"
-                f"All pairs below score/EA threshold.\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏰ Next update: 11:59 AM (London open)"
-            )
-        else:
-            send_telegram(
-                f"{title}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Period: {period}\n\n"
-                f"No qualifying signals overnight.\n"
-                f"All pairs below score/EA threshold.\n\n"
-                f"Market likely ranging or low volatility.\n"
-                f"Wait for London session to establish direction.\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━"
-            )
-            off_session_buffer.clear()
-        return
-
-    # ── Build pair blocks ───────────────────────────────────
-    pair_blocks   = []
-    watch_pairs   = []   # STRONG + MODERATE only — for WATCH section (full mode)
-    mixed_blocks  = []
-
-    for key, data in off_session_buffer.items():
-        signals = data.get("signals", [])
-        if not signals:
-            continue
-
-        block = _build_pair_line(key, signals, msg_mode)
-        if block is None:
-            continue
-
-        # Separate mixed from directional for full mode ordering
-        if "MIXED" in block or "LOW DATA" in block:
-            mixed_blocks.append(block)
-        else:
-            pair_blocks.append(block)
-
-            # Determine if watch-worthy (full mode only)
-            if msg_mode == "full":
-                buys  = sum(1 for s in signals if s["direction"] == "BUY")
-                sells = sum(1 for s in signals if s["direction"] == "SELL")
-                total = len(signals)
-                dom   = max(buys, sells)
-                cons  = dom / total if total > 0 else 0
-                dir_  = "BUY" if buys >= sells else "SELL"
-                scores = [s["score"] for s in signals]
-                avg_s  = sum(scores) / len(scores) if scores else 0
-                conv   = _conviction_label(cons, avg_s, total)
-                if conv in ("STRONG", "MODERATE") and cons >= 0.80:
-                    emoji = "🟢" if dir_ == "BUY" else "🔴"
-                    watch_pairs.append(f"   {emoji} {key} {dir_} — {conv.lower()} overnight build")
-
-    # ── Assemble message ────────────────────────────────────
-    header = (
-        f"{title}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Period: {period}\n"
-        f"Signals: {total_signals} qualified across {len(off_session_buffer)} pairs\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-
-    body = "\n".join(pair_blocks)
-    if mixed_blocks and msg_mode == "full":
-        body += "\n" + "\n".join(mixed_blocks)
-
-    # Footer
-    if mode == "overnight":
-        footer = (
-            f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ Next update: 11:59 AM (London open)"
-        )
-    else:
-        # Watch list
-        watch_section = ""
-        if watch_pairs:
-            watch_section = (
-                f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 WATCH AT OPEN:\n"
-                + "\n".join(watch_pairs) + "\n"
-            )
-
-        # Calendar warning
-        calendar_section = ""
+    # FIX: fetch calendar OUTSIDE the lock — network calls must never hold locks
+    cal_txt = ""
+    if mode == "presession":
         try:
             cal = fetch_economic_calendar()
             if cal.get("high_impact_soon"):
-                events_str = ", ".join(cal.get("events", []))
-                calendar_section = (
-                    f"\n⚠️ HIGH IMPACT TODAY:\n"
-                    f"   {events_str}\n"
-                    f"   Trade conservatively — consider waiting post-release\n"
-                )
+                ev_names = [e if isinstance(e, str) else e.get("event", "")
+                            for e in cal.get("events", [])]
+                cal_txt = f"\n⚠️ HIGH IMPACT TODAY: {', '.join(ev_names)}\nTrade conservatively.\n"
         except Exception:
             pass
 
-        footer = (
-            f"{watch_section}"
-            f"{calendar_section}"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Good luck. Session starting now.\n"
-            f"Buffer cleared."
-        )
+    with buffer_lock:
+        total = sum(len(v.get("signals",[])) for v in off_session_buffer.values())
+        if total == 0:
+            txt = (f"{title} | {time_str}\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"Period: {period}\n\nNo qualifying signals overnight.\n"
+                   f"All pairs below score/EA threshold.\n"
+                   f"Wait for London session to establish direction.\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━━━━")
+            if mode == "overnight":
+                txt += "\n⏰ Next update: 11:59 AM (London open)"
+            send_telegram(txt)
+            if mode == "presession":
+                off_session_buffer.clear()
+            return
 
-        # Clear buffer after 11:59 AM send
-        off_session_buffer.clear()
+        header = (f"{title} | {time_str}\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                  f"Period: {period}\nSignals: {total} qualified\n"
+                  f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        blocks = []
+        watch  = []
+
+        for key, buf in off_session_buffer.items():
+            sigs = buf.get("signals", [])
+            if not sigs:
+                continue
+            tot_s = len(sigs)
+            buys  = sum(1 for s in sigs if s["direction"] == "BUY")
+            sells = tot_s - buys
+            dom   = "BUY" if buys >= sells else "SELL"
+            dom_c = max(buys, sells)
+            cons  = dom_c / tot_s
+            emoji = "🟢" if dom == "BUY" else "🔴"
+            scrs  = [s["score"] for s in sigs]
+            avg_s = round(sum(scrs)/tot_s, 1)
+            prices= [s["price"] for s in sigs]
+            delta = prices[-1] - prices[0]
+            ds    = f"+{delta:.5f}" if delta >= 0 else f"{delta:.5f}"
+            bar   = _conviction_bar(cons * 100)
+            pct_s = f"{round(cons*100,1)}%"
+            ea_a  = round(sum(s["ea"] for s in sigs)/tot_s, 1)
+            conv  = _conviction_label(cons, avg_s, tot_s)
+
+            if cons < 0.60:
+                if mode == "overnight":
+                    continue
+                blocks.append(f"⚪ {key:<8} — MIXED  {buys}B/{sells}S  Score avg {avg_s}\n")
+                continue
+
+            if mode == "overnight":
+                blocks.append(f"{emoji} {key:<8} {dom}  {bar}  {pct_s}\n"
+                               f"   {tot_s} signals | Score {avg_s} avg | EA {ea_a}\n"
+                               f"   {prices[0]:.5f} → {prices[-1]:.5f}  ({ds})\n")
+            else:
+                blocks.append(f"{emoji} {key}  —  {dom}  {bar}  {pct_s}\n"
+                               f"   {tot_s} signals  |  {dom_c} {dom}  {tot_s-dom_c} {'SELL' if dom=='BUY' else 'BUY'}\n"
+                               f"   Score: {min(scrs)}–{max(scrs)} (avg {avg_s})  EA avg {ea_a}\n"
+                               f"   {prices[0]:.5f} → {prices[-1]:.5f}  ({ds})  [{conv}]\n")
+                if conv in ("STRONG","MODERATE") and cons >= 0.80:
+                    watch.append(f"   {emoji} {key} {dom} — {conv.lower()} overnight build")
+
+        body = "\n".join(blocks)
+
+        if mode == "overnight":
+            footer = "\n━━━━━━━━━━━━━━━━━━━━━━━━━\n⏰ Next update: 11:59 AM (London open)"
+        else:
+            watch_txt = ""
+            if watch:
+                watch_txt = "\n━━━━━━━━━━━━━━━━━━━━━━━━━\n📌 WATCH AT OPEN:\n" + "\n".join(watch) + "\n"
+            # cal_txt already fetched outside the lock above
+            footer = (watch_txt + cal_txt +
+                      "\n━━━━━━━━━━━━━━━━━━━━━━━━━\nGood luck. Session starting now.\nBuffer cleared.")
+            off_session_buffer.clear()
 
     send_telegram(header + body + footer)
-    print(f"Pre-session snapshot sent: mode={mode} | signals={total_signals}")
 
 
 # ==========================================
 # DAILY RESET
 # ==========================================
 def reset_day():
-    global current_day, pair_session_tracker, neutral_cache
+    global current_day, pair_session_tracker, neutral_cache, off_session_buffer
     today = datetime.now(timezone.utc).date()
     if current_day != today:
         current_day = today
-        pair_session_tracker = {}
-        neutral_cache = {}
+        with trade_lock:
+            pair_session_tracker = {}
+        with cache_lock:
+            neutral_cache = {}
+        with buffer_lock:
+            off_session_buffer = {}
         print(f"Day reset: {today}")
 
 
 # ==========================================
-# SESSION DETECTION
+# SESSION GATE
 # ==========================================
 def get_session_by_time():
     now_utc = datetime.now(timezone.utc)
     pk_hour = (now_utc.hour + 5) % 24
     if 12 <= pk_hour < 18:
         return "london"
-    elif 18 <= pk_hour or pk_hour < 2:
+    elif 18 <= pk_hour or pk_hour <= 2:   # fixed: <= 2 includes 02:00
         return "newyork"
-    else:
-        return "off"
-
+    return "off"
 
 def session_gate(symbol):
-    global pair_session_tracker
     reset_day()
     session = get_session_by_time()
     if session == "off":
         return False, "Outside trading sessions", session
-    symbol_clean = clean_symbol(symbol)
-    key = f"{symbol_clean}_{session}"
+    sc  = clean_symbol(symbol)
+    key = f"{sc}_{session}"
     now = datetime.now(timezone.utc)
-    timestamps = pair_session_tracker.get(key, [])
-    if len(timestamps) >= 2:
-        return False, f"2/2 trades used for {symbol_clean} in {session}", session
-    if len(timestamps) == 1:
-        diff = (now - timestamps[0]).total_seconds()
-        if diff < 7200:
-            remaining = int(7200 - diff)
-            return False, f"Cooldown active — {remaining}s remaining", session
+    with trade_lock:
+        ts = pair_session_tracker.get(key, [])
+        if len(ts) >= 2:
+            return False, f"2/2 trades used for {sc} in {session}", session
+        if len(ts) == 1:
+            diff = (now - ts[0]).total_seconds()
+            if diff < 7200:
+                return False, f"Cooldown active — {int(7200-diff)}s remaining", session
     return True, "OK", session
 
-
 def register_trade(symbol, session):
-    global pair_session_tracker
-    symbol_clean = clean_symbol(symbol)
-    key = f"{symbol_clean}_{session}"
+    sc  = clean_symbol(symbol)
+    key = f"{sc}_{session}"
     now = datetime.now(timezone.utc)
-    timestamps = pair_session_tracker.get(key, [])
-    timestamps.append(now)
-    if len(timestamps) > 2:
-        timestamps = timestamps[-2:]
-    pair_session_tracker[key] = timestamps
-    print(f"Trade registered: {symbol_clean} {session} | count: {len(timestamps)}/2")
+    with trade_lock:
+        ts = pair_session_tracker.get(key, [])
+        ts.append(now)
+        if len(ts) > 2:
+            ts = ts[-2:]
+        pair_session_tracker[key] = ts
+    print(f"Trade registered: {sc} {session} | {len(ts)}/2")
 
 
 # ==========================================
-# FINNHUB — SYMBOL-SPECIFIC NEWS
+# FINNHUB
 # ==========================================
 def fetch_finnhub(symbol):
     if not FINNHUB_KEY:
         return {"sentiment": "NEUTRAL", "headlines": [], "symbol_matched": False}
-
     symbol = clean_symbol(symbol)
-    SYMBOL_KEYWORDS = {
-        "EURUSD":  ["EUR", "Euro", "ECB", "European"],
-        "GBPUSD":  ["GBP", "Pound", "Sterling", "BOE"],
-        "USDJPY":  ["JPY", "Yen", "BOJ", "Japan"],
-        "USDCHF":  ["CHF", "Franc", "SNB", "Swiss"],
-        "AUDUSD":  ["AUD", "Aussie", "RBA", "Australia"],
-        "NZDUSD":  ["NZD", "Kiwi", "RBNZ", "New Zealand"],
-        "USDCAD":  ["CAD", "Loonie", "BOC", "Canada"],
-        "GBPJPY":  ["GBP", "Pound", "JPY", "Yen"],
-        "EURJPY":  ["EUR", "Euro", "JPY", "Yen"],
-        "EURGBP":  ["EUR", "Euro", "GBP", "Pound"],
-        "GBPCHF":  ["GBP", "Pound", "CHF", "Franc"],
-        "XAUUSD":  ["Gold", "XAU", "bullion", "precious metals", "Fed"],
-        "GOLD":    ["Gold", "XAU", "bullion"],
-        "XAGUSD":  ["Silver", "XAG"],
-        "USOIL":   ["Oil", "WTI", "crude", "OPEC"],
-        "UKOIL":   ["Oil", "Brent", "crude", "OPEC"],
-        "BTCUSD":  ["Bitcoin", "BTC", "crypto"],
-        "ETHUSD":  ["Ethereum", "ETH", "crypto"],
-        "US30":    ["Dow Jones", "DJIA", "Wall Street"],
-        "NAS100":  ["Nasdaq", "tech stocks"],
-        "SPX500":  ["S&P 500", "SPX"],
+    kw_map = {
+        "EURUSD":["EUR","Euro","ECB"],"GBPUSD":["GBP","Pound","BOE"],
+        "USDJPY":["JPY","Yen","BOJ"],"USDCHF":["CHF","Franc","SNB"],
+        "AUDUSD":["AUD","Aussie","RBA"],"NZDUSD":["NZD","Kiwi","RBNZ"],
+        "USDCAD":["CAD","Loonie","BOC"],"GBPJPY":["GBP","JPY","Pound","Yen"],
+        "EURJPY":["EUR","JPY"],"EURGBP":["EUR","GBP"],"GBPCHF":["GBP","CHF"],
+        "XAUUSD":["Gold","XAU","bullion","Fed"],"XAGUSD":["Silver","XAG"],
+        "USOIL":["Oil","WTI","crude","OPEC"],"UKOIL":["Oil","Brent","OPEC"],
+        "BTCUSD":["Bitcoin","BTC"],"ETHUSD":["Ethereum","ETH"],
+        "US30":["Dow Jones","DJIA"],"NAS100":["Nasdaq"],"SPX500":["S&P 500"],
     }
-    keywords = SYMBOL_KEYWORDS.get(symbol, [symbol[:3], symbol[3:]] if len(symbol) == 6 else [symbol])
-
+    kws = kw_map.get(symbol, [symbol[:3], symbol[3:]] if len(symbol)==6 else [symbol])
     try:
         r = requests.get(
             f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}",
-            timeout=10
-        )
+            timeout=10)
         r.raise_for_status()
-        all_news = r.json()[:30]
-        matched = [n.get("headline", "") for n in all_news
-                   if any(kw.lower() in n.get("headline", "").lower() for kw in keywords)]
+        news    = r.json()[:30]
+        matched = [n.get("headline","") for n in news
+                   if any(k.lower() in n.get("headline","").lower() for k in kws)]
         if not matched:
-            matched = [n.get("headline", "") for n in all_news[:5]]
-
-        text = " ".join(matched).lower()
-        bull = sum(w in text for w in ["rise", "bull", "gain", "growth", "hawkish", "strong"])
-        bear = sum(w in text for w in ["fall", "bear", "drop", "recession", "dovish", "weak"])
+            matched = [n.get("headline","") for n in news[:5]]
+        text      = " ".join(matched).lower()
+        bull      = sum(w in text for w in ["rise","bull","gain","growth","hawkish","strong"])
+        bear      = sum(w in text for w in ["fall","bear","drop","recession","dovish","weak"])
         sentiment = "POSITIVE" if bull > bear else "NEGATIVE" if bear > bull else "NEUTRAL"
-
         return {"sentiment": sentiment, "headlines": matched[:5], "symbol_matched": bool(matched)}
     except Exception as e:
         print(f"Finnhub error: {e}")
@@ -906,50 +650,40 @@ def fetch_economic_calendar():
         return {"high_impact_soon": False, "events": []}
     try:
         now = datetime.now(timezone.utc)
-        url = (
-            f"https://finnhub.io/api/v1/calendar/economic"
-            f"?from={now.strftime('%Y-%m-%d')}"
-            f"&to={(now + timedelta(days=1)).strftime('%Y-%m-%d')}"
-            f"&token={FINNHUB_KEY}"
-        )
+        url = (f"https://finnhub.io/api/v1/calendar/economic"
+               f"?from={now.strftime('%Y-%m-%d')}"
+               f"&to={(now+timedelta(days=1)).strftime('%Y-%m-%d')}"
+               f"&token={FINNHUB_KEY}")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         events = r.json().get("economicCalendar", [])
-        high = [e for e in events if e.get("impact") == "high"]
-        return {"high_impact_soon": bool(high), "events": [e.get("event", "") for e in high[:3]]}
+        high   = [e for e in events if e.get("impact") == "high"]
+        return {"high_impact_soon": bool(high), "events": high}
     except Exception as e:
         print(f"Calendar error: {e}")
         return {"high_impact_soon": False, "events": []}
 
 
 # ==========================================
-# GDELT — MACRO RISK
+# GDELT
 # ==========================================
 def fetch_gdelt():
     try:
         r = requests.get(
             "https://api.gdeltproject.org/api/v2/doc/doc?query=global%20economy&mode=ArtList&format=json",
-            timeout=10
-        )
+            timeout=10)
         r.raise_for_status()
-        articles = r.json().get("articles", [])[:5]
-        score = sum(
-            1 for a in articles
-            if any(w in a.get("title", "").lower()
-                   for w in ["war", "inflation", "crisis", "recession", "sanctions"])
-        )
+        articles = r.json().get("articles",[])[:5]
+        score    = sum(1 for a in articles
+                       if any(w in a.get("title","").lower()
+                              for w in ["war","inflation","crisis","recession","sanctions"]))
         risk = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
         return {"risk": risk, "score": score}
     except Exception as e:
         print(f"GDELT error: {e}")
         return {"risk": "LOW", "score": 0}
 
-
-# ==========================================
-# PARALLEL DATA FETCH
-# ==========================================
 def fetch_all_live_data(symbol):
-    """Runs Finnhub, GDELT, Calendar simultaneously. Saves 2-4 seconds."""
     with ThreadPoolExecutor(max_workers=3) as ex:
         fn = ex.submit(fetch_finnhub, symbol)
         fm = ex.submit(fetch_gdelt)
@@ -958,7 +692,7 @@ def fetch_all_live_data(symbol):
 
 
 # ==========================================
-# TWELVE DATA — 10 INDICATORS
+# TWELVE DATA — 7 CORE INDICATORS
 # ==========================================
 def fetch_twelve_data(symbol):
     if not TWELVE_DATA_KEY:
@@ -966,136 +700,298 @@ def fetch_twelve_data(symbol):
     symbol = clean_symbol(symbol)
     if "/" not in symbol and len(symbol) == 6:
         symbol = f"{symbol[:3]}/{symbol[3:]}"
-
     base = "https://api.twelvedata.com"
-    k = TWELVE_DATA_KEY
+    k    = TWELVE_DATA_KEY
     endpoints = {
         "rsi":      f"{base}/rsi?symbol={symbol}&interval=1h&time_period=14&apikey={k}",
         "macd":     f"{base}/macd?symbol={symbol}&interval=1h&apikey={k}",
         "stoch":    f"{base}/stoch?symbol={symbol}&interval=1h&apikey={k}",
-        "cci":      f"{base}/cci?symbol={symbol}&interval=1h&time_period=20&apikey={k}",
-        "mfi":      f"{base}/mfi?symbol={symbol}&interval=1h&time_period=14&apikey={k}",
-        "willr":    f"{base}/willr?symbol={symbol}&interval=1h&time_period=14&apikey={k}",
-        "obv":      f"{base}/obv?symbol={symbol}&interval=1h&apikey={k}",
-        "aroon":    f"{base}/aroon?symbol={symbol}&interval=1h&time_period=25&apikey={k}",
+        "bbands":   f"{base}/bbands?symbol={symbol}&interval=1h&time_period=20&apikey={k}",
+        "adx":      f"{base}/adx?symbol={symbol}&interval=1h&time_period=14&apikey={k}",
+        "atr":      f"{base}/atr?symbol={symbol}&interval=1h&time_period=14&apikey={k}",
         "ichimoku": f"{base}/ichimoku?symbol={symbol}&interval=1h&apikey={k}",
-        "psar":     f"{base}/psar?symbol={symbol}&interval=1h&apikey={k}",
     }
     raw = {}
     for name, url in endpoints.items():
         try:
             resp = requests.get(url, timeout=8).json()
-            raw[name] = resp.get("values", [{}])[0] if resp.get("values") else resp.get("value", "N/A")
+            raw[name] = resp.get("values",[{}])[0] if resp.get("values") else resp.get("value","N/A")
         except Exception as e:
-            print(f"TwelveData {name} error: {e}")
+            print(f"TwelveData {name}: {e}")
             raw[name] = "N/A"
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     def g(key, sub):
         v = raw.get(key)
-        return v.get(sub, "N/A") if isinstance(v, dict) else "N/A"
+        return v.get(sub,"N/A") if isinstance(v,dict) else "N/A"
+
+    def sv(x):
+        if x == "N/A": return "N/A"
+        try:
+            f = float(x)
+            return "N/A" if f == 0 else x
+        except Exception:
+            return x
 
     parsed = {
-        "rsi":                 g("rsi", "rsi"),
-        "macd":                g("macd", "macd"),
-        "macd_signal":         g("macd", "macd_signal"),
-        "macd_histogram":      g("macd", "macd_histogram"),
-        "stoch_k":             g("stoch", "slowk"),
-        "stoch_d":             g("stoch", "slowd"),
-        "cci":                 g("cci", "cci"),
-        "mfi":                 g("mfi", "mfi"),
-        "willr":               g("willr", "willr"),
-        "obv":                 g("obv", "obv"),
-        "aroon_up":            g("aroon", "aroon_up"),
-        "aroon_down":          g("aroon", "aroon_down"),
-        "ichimoku_conversion": g("ichimoku", "tenkan_sen"),
-        "ichimoku_base":       g("ichimoku", "kijun_sen"),
-        "ichimoku_span_a":     g("ichimoku", "senkou_span_a"),
-        "ichimoku_span_b":     g("ichimoku", "senkou_span_b"),
-        "psar":                g("psar", "psar"),
+        "rsi":                  sv(g("rsi","rsi")),
+        "macd":                 sv(g("macd","macd")),
+        "macd_signal":          sv(g("macd","macd_signal")),
+        "macd_histogram":       sv(g("macd","macd_histogram")),
+        "stoch_k":              sv(g("stoch","slowk")),
+        "stoch_d":              sv(g("stoch","slowd")),
+        "bb_upper":             sv(g("bbands","upper_band")),
+        "bb_middle":            sv(g("bbands","middle_band")),
+        "bb_lower":             sv(g("bbands","lower_band")),
+        "adx":                  sv(g("adx","adx")),
+        "atr":                  sv(g("atr","atr")),
+        "ichimoku_conversion":  sv(g("ichimoku","tenkan_sen")),
+        "ichimoku_base":        sv(g("ichimoku","kijun_sen")),
+        "ichimoku_span_a":      sv(g("ichimoku","senkou_span_a")),
+        "ichimoku_span_b":      sv(g("ichimoku","senkou_span_b")),
     }
-    missing = [k for k, v in parsed.items() if v == "N/A"]
-    total = len(parsed)
-    if not missing:
-        parsed["_quality"] = f"FULL ({total}/{total})"
-    elif len(missing) <= 5:
-        parsed["_quality"] = f"PARTIAL ({total - len(missing)}/{total})"
-    else:
-        parsed["_quality"] = f"POOR ({total - len(missing)}/{total})"
+    try:
+        upper  = float(parsed["bb_upper"])
+        lower  = float(parsed["bb_lower"])
+        middle = float(parsed["bb_middle"])
+        parsed["bb_width"] = round((upper - lower)/middle * 100, 2) if middle > 0 else None
+    except Exception:
+        parsed["bb_width"] = None
+
+    missing        = [k for k,v in parsed.items() if v == "N/A"]
+    tot            = len(parsed)
+    parsed["_quality"] = (
+        f"FULL ({tot}/{tot})"        if not missing         else
+        f"GOOD ({tot-len(missing)}/{tot})"  if len(missing) <= 3 else
+        f"PARTIAL ({tot-len(missing)}/{tot})"
+    )
     return parsed
 
 
 # ==========================================
-# PROMPT BUILDER — SHARED CONTEXT BLOCK
+# MARKET CONTEXT (text — injected into all prompts)
 # ==========================================
 def build_market_context(signal, news, macro, twelve, calendar):
-    """
-    Builds the shared market data block injected into all AI prompts.
-    Written as a market brief — NOT as API/signal metadata.
-    """
-    cal_note = ""
-    if calendar.get("high_impact_soon"):
-        cal_note = f"High-impact economic events scheduled today: {', '.join(calendar.get('events', []))}."
-    else:
-        cal_note = "No high-impact economic events scheduled today."
+    s   = {k:v for k,v in signal.items() if k not in ["twelve_data","calendar","tf","timeframe"]}
+    sym = s.get("symbol","N/A")
 
-    headlines_text = "\n".join(
-        f"  - {h}" for h in news.get("headlines", [])
-    ) or "  No relevant headlines found."
+    # Currency-specific calendar events
+    currencies     = [clean_symbol(sym)[:3], clean_symbol(sym)[3:]] if len(clean_symbol(sym)) == 6 else [sym]
+    events_raw     = calendar.get("events", [])
+    relevant_ev    = []
+    for e in events_raw:
+        if isinstance(e, dict) and e.get("currency","") in currencies:
+            relevant_ev.append(e.get("event",""))
+        elif isinstance(e, str):
+            relevant_ev.append(e)
+    cal_note = (f"⚠️ RELEVANT HIGH IMPACT: {', '.join(relevant_ev)}"
+                if relevant_ev else "No relevant high-impact events.")
 
-    signal_clean = {k: v for k, v in signal.items()
-                    if k not in ["twelve_data", "calendar", "tf", "timeframe"]}
+    headlines  = "\n".join(f"  - {h}" for h in news.get("headlines",[])) or "  None."
+    tq         = twelve.get("_quality","Unknown")
+    adx_v      = safe_float(twelve.get("adx"))
+    bb_w       = twelve.get("bb_width")
+    regime     = detect_market_regime(adx_v, bb_w)
 
-    twelve_quality = twelve.get("_quality", "Unknown")
+    # Pre-compute warnings
+    pivot_zone   = s.get("pivot_zone","N/A")
+    vwap_band    = s.get("vwap_band","N/A")
+    direction    = s.get("direction","N/A")
+    lon_fu       = safe_bool(s.get("lon_fail_up"))
+    lon_fd       = safe_bool(s.get("lon_fail_down"))
+    ny_fu        = safe_bool(s.get("ny_fail_up"))
+    ny_fd        = safe_bool(s.get("ny_fail_down"))
+    sv_conf      = s.get("sv_confidence","N/A")
+    sv_t1        = s.get("sv_t1_rate","N/A")
+
+    warnings = []
+    if "ABOVE_R2" in pivot_zone or "ABOVE_R3" in pivot_zone:
+        warnings.append("🚨 PRICE AT EXTREME RESISTANCE (weekly R2/R3)")
+    if "BELOW_S2" in pivot_zone or "BELOW_S3" in pivot_zone:
+        warnings.append("🚨 PRICE AT EXTREME SUPPORT (weekly S2/S3)")
+    if (lon_fu or ny_fu):
+        warnings.append("🚨 FAILED BULLISH AUCTION — market rejected higher prices")
+    if (lon_fd or ny_fd):
+        warnings.append("🚨 FAILED BEARISH AUCTION — market rejected lower prices")
+    if ("EXTREME_HIGH" in vwap_band and "LONG" in direction.upper()):
+        warnings.append("🚨 VWAP EXTREME HIGH — mean reversion risk on BUY")
+    if ("EXTREME_LOW" in vwap_band and "SHORT" in direction.upper()):
+        warnings.append("🚨 VWAP EXTREME LOW — mean reversion risk on SELL")
+    if sv_conf == "LOW":
+        warnings.append(f"🚨 VALIDATOR LOW CONFIDENCE — T1 hit rate: {sv_t1}%")
+
+    warn_block = ("\n".join(warnings) + "\n") if warnings else ""
 
     context = f"""
-MARKET CONTEXT — {signal_clean.get('symbol', 'N/A')} | H1 TIMEFRAME
+MARKET BRIEF — {sym} | H1 TIMEFRAME
 {'='*55}
+{warn_block}
+SIGNAL ENGINE:
+  Direction:      {s.get('direction','N/A')}    Score: {s.get('score','N/A')}/100  ({s.get('signal_strength','N/A')})
+  Structure Bias: {s.get('structure_bias','N/A')}      HH/HL: {s.get('hh_hl_pred','N/A')}  Retrace: {s.get('retrace_pct','N/A')}% ({s.get('retrace_zone','N/A')})
+  EA Filter:      {s.get('ea_score','N/A')}/8  ({s.get('ea_quality','N/A')})   Gate: {s.get('ea_gate','N/A')}
+  Pillars Bull:   {s.get('pillars_bull','N/A')}/5      Agreement Bonus: {s.get('agreement_bonus','N/A')}
+  Raw Signal:     {s.get('raw_signal','N/A')}
 
-PRICE ACTION & STRUCTURE:
-  Current Price:    {signal_clean.get('price', 'N/A')}
-  Trend Direction:  {signal_clean.get('direction', 'N/A')}
-  Structure Bias:   {signal_clean.get('structure_bias', signal_clean.get('structure', 'N/A'))}
-  Signal Score:     {signal_clean.get('score', 'N/A')}/100
-  EA Filter Score:  {signal_clean.get('ea_score', signal_clean.get('ea_filter', 'N/A'))}/8
-  ADX:              {signal_clean.get('adx', 'N/A')}
-  ATR:              {signal_clean.get('atr', 'N/A')}
-  EMA 21/50/200:    {signal_clean.get('ema_21', 'N/A')} / {signal_clean.get('ema_50', 'N/A')} / {signal_clean.get('ema_200', 'N/A')}
-  Volume Ratio:     {signal_clean.get('volume_ratio', 'N/A')}
-  Validator:        {signal_clean.get('validator', 'N/A')}
+PRICE & TREND:
+  Price:          {s.get('price','N/A')}   ATR: {s.get('atr','N/A')}
+  ADX:            {s.get('adx','N/A')}  DI+: {s.get('diplus','N/A')}  DI-: {s.get('diminus','N/A')}   Regime: {regime}
+  EMA 21/50/200:  {s.get('ema_21','N/A')} / {s.get('ema_50','N/A')} / {s.get('ema_200','N/A')}
+  EMA Align:      {s.get('ema_align','N/A')}   Slope: {s.get('ema_slope','N/A')}
+  Swing H/L:      {s.get('last_sh','N/A')} / {s.get('last_sl','N/A')}
 
-TECHNICAL INDICATORS (H1 — Live):
-  Data Quality:     {twelve_quality}
-  RSI (14):         {twelve.get('rsi', 'N/A')}
-  MACD:             {twelve.get('macd', 'N/A')} | Signal: {twelve.get('macd_signal', 'N/A')} | Hist: {twelve.get('macd_histogram', 'N/A')}
-  Stochastic K/D:   {twelve.get('stoch_k', 'N/A')} / {twelve.get('stoch_d', 'N/A')}
-  CCI (20):         {twelve.get('cci', 'N/A')}
-  MFI (14):         {twelve.get('mfi', 'N/A')}
-  Williams %R:      {twelve.get('willr', 'N/A')}
-  OBV:              {twelve.get('obv', 'N/A')}
-  Aroon Up/Down:    {twelve.get('aroon_up', 'N/A')} / {twelve.get('aroon_down', 'N/A')}
-  Ichimoku Conv/Base: {twelve.get('ichimoku_conversion', 'N/A')} / {twelve.get('ichimoku_base', 'N/A')}
-  Ichimoku Span A/B:  {twelve.get('ichimoku_span_a', 'N/A')} / {twelve.get('ichimoku_span_b', 'N/A')}
-  Parabolic SAR:    {twelve.get('psar', 'N/A')}
+VWAP:
+  Session VWAP:   {s.get('vwap','N/A')}  ({s.get('price_vs_vwap','N/A')})   Band: {s.get('vwap_band','N/A')}
+  Weekly VWAP:    {s.get('weekly_vwap','N/A')}  ({s.get('price_vs_wvwap','N/A')})
+  Monthly VWAP:   {s.get('monthly_vwap','N/A')}
 
-NEWS & SENTIMENT (Symbol-Specific):
-  Sentiment:        {news.get('sentiment', 'N/A')}
-  Symbol-Matched:   {'Yes' if news.get('symbol_matched') else 'No — general headlines used'}
+WEEKLY PIVOTS:
+  R3:{s.get('weekly_r3','N/A')}  R2:{s.get('weekly_r2','N/A')}  R1:{s.get('weekly_r1','N/A')}
+  P: {s.get('weekly_pivot','N/A')}
+  S1:{s.get('weekly_s1','N/A')}  S2:{s.get('weekly_s2','N/A')}  S3:{s.get('weekly_s3','N/A')}
+  Zone: {pivot_zone}   Nearest: {s.get('nearest_level','N/A')} (dist: {s.get('nearest_dist','N/A')})
+
+AUCTION:
+  Label:          {s.get('auction_label','N/A')}   Pts: {s.get('auction_pts','N/A')}
+  Failed: L↑{lon_fu} L↓{lon_fd} NY↑{ny_fu} NY↓{ny_fd}
+  Macro Score:    {s.get('macro_score','N/A')}
+
+VALIDATOR (HISTORICAL):
+  Valid:{s.get('sv_valid','N/A')}  Confidence:{sv_conf}  Matches:{s.get('sv_matches','N/A')}
+  T1:{s.get('sv_t1_rate','N/A')}%  T2:{s.get('sv_t2_rate','N/A')}%  T3:{s.get('sv_t3_rate','N/A')}%
+  MAE:{s.get('sv_avg_mae','N/A')}  MFE:{s.get('sv_avg_mfe','N/A')}  Pullback:{s.get('sv_pb_rate','N/A')}%
+  Form:{s.get('sv_recent_form','N/A')}   T1:{s.get('t1_target','N/A')}  T2:{s.get('t2_target','N/A')}
+  Volume Ratio:   {s.get('volume_ratio','N/A')}
+
+TWELVE DATA ({tq}):
+  RSI:{twelve.get('rsi','N/A')}  MACD:{twelve.get('macd','N/A')}  Hist:{twelve.get('macd_histogram','N/A')}
+  Stoch K/D:{twelve.get('stoch_k','N/A')}/{twelve.get('stoch_d','N/A')}
+  BB: {twelve.get('bb_lower','N/A')} / {twelve.get('bb_middle','N/A')} / {twelve.get('bb_upper','N/A')}  W:{twelve.get('bb_width','N/A')}%
+  ADX:{twelve.get('adx','N/A')}  ATR:{twelve.get('atr','N/A')}
+  Ichimoku Conv/Base:{twelve.get('ichimoku_conversion','N/A')}/{twelve.get('ichimoku_base','N/A')}
+  Span A/B:{twelve.get('ichimoku_span_a','N/A')}/{twelve.get('ichimoku_span_b','N/A')}
+
+NEWS & MACRO:
+  Sentiment:{news.get('sentiment','N/A')}  Macro:{macro.get('risk','N/A')}
+  {cal_note}
   Headlines:
-{headlines_text}
-
-MACRO & CALENDAR:
-  Global Risk:      {macro.get('risk', 'N/A')}
-  Calendar:         {cal_note}
-{'='*55}"""
-    return context.strip()
+{headlines}
+{'='*55}
+""".strip()
+    return context
 
 
 # ==========================================
-# GEMINI — ROUND 1 (BLIND — NO CHATGPT INPUT)
-# Analysis only. No SL/TP.
+# ROUND 1 ANALYSIS PROMPT (shared by both AIs)
 # ==========================================
-def gemini_analysis(signal, news, macro):
+ROUND1_RULES = """
+━━━ ANALYSIS FRAMEWORK — FOLLOW EVERY STEP IN ORDER ━━━
+
+STEP 1 — HARD BLOCKS
+Check each condition first. If any triggers → output NEUTRAL immediately, skip remaining steps.
+
+  A) CALENDAR      2+ relevant high-impact events for this pair's currencies → NEUTRAL
+  B) PIVOT EXTREME ABOVE_R2 or ABOVE_R3 zone + BUY signal → NEUTRAL
+                   BELOW_S2 or BELOW_S3 zone + SELL signal → NEUTRAL
+  C) FAILED AUCTION Failed bullish auction active + BUY signal → NEUTRAL or SELL
+                    Failed bearish auction active + SELL signal → NEUTRAL or BUY
+  D) VALIDATOR     sv_confidence = LOW AND sv_t1_rate < 35% → NEUTRAL
+  E) TRIPLE EXHAUST RSI > 70 AND Stochastic K > 80 AND price above BB upper → NEUTRAL
+  F) LOW VOLUME    volume_ratio < 0.6 → NEUTRAL (no institutional participation)
+  G) MACRO+RANGING GDELT macro = HIGH AND ADX < 20 → NEUTRAL (noise, not signal)
+
+STEP 2 — CONFLICT RESOLUTION HIERARCHY
+When indicators disagree, resolve using this priority order (top = highest):
+
+  1st  STRUCTURE   HH/HL patterns + swing highs/lows — always wins
+  2nd  PILLARS     4 or more of 5 pillars aligned = override oscillators
+  3rd  ADX + DI   ADX > 25 with DI+ > DI- (bull) or DI- > DI+ (bear) = trend confirmed
+  4th  AUCTION    Failed auction signal overrides momentum readings
+  5th  OSCILLATORS RSI, Stoch, CCI — these are lagging, lowest weight
+
+  RULE: RSI = 72 (overbought) BUT structure = HH/HL + 4/5 pillars bullish
+        → IGNORE RSI. Output BUY. Structure and pillars override oscillators.
+
+STEP 3 — MOMENTUM SUSTAINABILITY
+Determine if current momentum can continue or is exhausted.
+
+  SUSTAINABLE (entry is fine):
+    RSI between 40-70 on BUY signal, or 30-60 on SELL signal
+    MACD histogram positive and expanding (not shrinking)
+    ADX > 25 and still rising
+    Price within 1x ATR of EMA21
+
+  EXHAUSTED (output NEUTRAL with reason "exhausted momentum"):
+    RSI > 80 on BUY, or RSI < 20 on SELL
+    Price more than 2.5x ATR above EMA21 on BUY (stretched too far)
+    MACD histogram declining while price still moving same direction
+
+STEP 4 — CHART ANALYSIS (when chart image is provided)
+Examine the chart image carefully. Identify and report on what you actually see:
+
+  Structural Patterns:
+    BOS (Break of Structure)   swing high/low broken with conviction = continuation
+    CHoCH (Change of Character) BOS in opposite direction = potential reversal
+    Higher Highs / Higher Lows  bullish structure
+    Lower Highs / Lower Lows    bearish structure
+
+  Reversal Patterns:
+    Double Top / Double Bottom     equal highs/lows with rejection between them
+    Head and Shoulders / Inverse   three peaks, middle highest/lowest
+    Rising Wedge (bearish) / Falling Wedge (bullish)
+    Bearish Engulfing / Bullish Engulfing candles
+    Shooting Star / Hammer candles
+    Doji at key levels (indecision at resistance/support)
+    Inside Bar (compression before breakout)
+
+  Price Action Signals:
+    Wick rejections  wick longer than 2x candle body = price rejected that direction
+    Liquidity grabs  spike beyond key level then sharp reversal = trap
+    Support/Resistance  3+ touches of same level = strong zone
+
+  Context:
+    EMA stack (21, 50, 200) aligned bullish or bearish?
+    Price relative to VWAP — extended or healthy?
+    Pivot levels visible on chart vs current price
+
+  CHART vs DATA CONFLICTS:
+    If chart shows CHoCH but Pine Script says BULL structure → flag the conflict explicitly
+    If chart confirms BOS in signal direction → mention as additional confirmation
+    If chart shows major pattern (double top, H&S) opposing the signal → lean NEUTRAL
+
+STEP 5 — FUNDAMENTAL CHECK
+  Does news sentiment support or oppose the direction?
+  What is the central bank stance for this pair?
+  Does global macro risk (GDELT) raise concern?
+  Fundamental is SUPPORTING context only — cannot override confirmed technical structure.
+
+DIRECTION DECISION RULES:
+  Technical structure is PRIMARY
+  NEUTRAL when: any hard block fires, OR momentum exhausted,
+  OR chart shows major reversal pattern opposing the signal
+  BUY/SELL when: no hard blocks, structure confirmed, momentum sustainable,
+  chart aligned or neutral, fundamentals not strongly opposed
+  This is DIRECTION ASSESSMENT ONLY — do NOT provide entry price, SL, or TP
+
+REQUIRED OUTPUT FORMAT — respond in EXACTLY this format, no extra text:
+DIRECTION: [BUY/SELL/NEUTRAL]
+CONFIDENCE: [0-100]
+HARD BLOCK: [NONE — or state which block A-G triggered and the specific data that triggered it]
+CHART ANALYSIS: [Describe exactly what you see: BOS/CHoCH, patterns, wicks, EMA position, key levels. If no chart: state "No chart provided"]
+STRUCTURE CHECK: [passed/concern — state HH/HL, pillar count out of 5, ADX reading]
+MOMENTUM CHECK: [sustainable/exhausted/extended — state RSI value, distance from EMA21 in ATRs]
+OSCILLATOR CHECK: [clear/warning — state RSI, Stoch K, BB position]
+TECHNICAL VIEW: [2-3 sentences combining chart + data into your technical assessment]
+FUNDAMENTAL VIEW: [1-2 sentences — news sentiment, central bank stance, macro risk]
+REASON: [2-3 sentences — your complete final assessment combining all inputs]
+"""
+
+
+
+# ==========================================
+# GEMINI — ROUND 1 (BLIND, WITH CHART VISION)
+# ==========================================
+def gemini_analysis(signal, news, macro, chart_b64=None, chart_mime="image/png"):
     if not GEMINI_KEY:
         return "GEMINI UNAVAILABLE: No API key"
 
@@ -1103,115 +999,89 @@ def gemini_analysis(signal, news, macro):
     calendar = signal.get("calendar", {})
     context  = build_market_context(signal, news, macro, twelve, calendar)
 
-    symbol    = clean_symbol(safe_str(signal.get("symbol") or signal.get("ticker"), "this pair"))
-    structure = safe_str(signal.get("structure_bias") or signal.get("structure"), "N/A")
-    direction = safe_str(signal.get("direction"), "N/A")
+    prompt_text = f"""You are an experienced institutional trader and market analyst.
+Your analysis is INDEPENDENT — you have not seen any other analyst's view.
 
-    prompt = f"""You are an experienced market analyst assessing whether conditions currently favor a trade.
+Analyse the H1 chart and all market data below.
+{ROUND1_RULES}
 
-Review the following market data and form your independent view:
+MARKET DATA:
+{context}"""
 
-{context}
+    # Build Gemini content parts
+    parts = [{"text": prompt_text}]
+    if chart_b64:
+        parts.append({
+            "inline_data": {
+                "mime_type": chart_mime,
+                "data":      chart_b64
+            }
+        })
+        parts.append({"text": "\nThe chart image above shows the H1 chart. Analyse it thoroughly in your CHART ANALYSIS field."})
 
-ANALYSIS GUIDELINES:
-- Focus on the H1 timeframe only
-- The structural bias is {structure} and the chart signal direction is {direction}
-- If structure and signal direction are aligned, that supports the case
-- If they conflict, that weakens the case
-- News and macro are supporting factors only — they cannot override technical structure
-- Only call NEUTRAL if technicals and fundamentals are genuinely opposed, or a high-impact event is imminent
-- Base your view on the full picture above — not any single indicator
-
-THIS IS A DIRECTION ASSESSMENT ONLY.
-Do not provide entry price, stop loss, or take profit at this stage.
-
-Respond in EXACTLY this format — no extra text:
-DIRECTION: [BUY/SELL/NEUTRAL]
-CONFIDENCE: [0-100%]
-NEWS IMPACT: [POSITIVE/NEGATIVE/NEUTRAL]
-MACRO RISK: [HIGH/MEDIUM/LOW]
-CALENDAR WARNING: [YES/NO]
-TECHNICAL VIEW: [Your reading of structure, momentum, and indicator alignment on H1]
-FUNDAMENTAL VIEW: [Your view on central bank policy, macro conditions, and sentiment for this pair]
-REASON: [2-3 sentences combining all factors into your final assessment]"""
+    payload = {
+        "contents":       [{"parts": parts}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1400}
+    }
 
     for attempt in range(3):
         try:
             r = requests.post(
                 GEMINI_URL,
                 headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 900}
-                },
-                timeout=30
+                json=payload,
+                timeout=40
             )
             r.raise_for_status()
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as e:
-            print(f"Gemini attempt {attempt+1} failed: {e}")
+            print(f"Gemini attempt {attempt+1}: {e}")
             if attempt < 2:
                 time.sleep(3)
     return "GEMINI UNAVAILABLE: Server busy"
 
 
 # ==========================================
-# CHATGPT — ROUND 1 (BLIND — NO GEMINI INPUT)
-# Analysis only. No SL/TP.
+# CHATGPT — ROUND 1 (BLIND, WITH CHART VISION)
 # ==========================================
-def chatgpt_analysis(symbol, price, signal, news, macro, calendar):
-    """
-    Round 1 is fully independent — ChatGPT does NOT receive Gemini's output.
-    This ensures genuine independent analysis before comparison.
-    """
+def chatgpt_analysis(symbol, price, signal, news, macro, calendar,
+                     chart_b64=None, chart_mime="image/png"):
     if not CHATGPT_KEY:
         return "CHATGPT ERROR: No API key"
 
     twelve  = signal.get("twelve_data", {})
     context = build_market_context(signal, news, macro, twelve, calendar)
 
-    structure = safe_str(signal.get("structure_bias") or signal.get("structure"), "N/A")
-    direction = safe_str(signal.get("direction"), "N/A")
+    prompt_text = f"""You are an experienced institutional trader and market analyst.
+Your analysis is INDEPENDENT — you have not seen any other analyst's view.
 
-    prompt = f"""You are an experienced market analyst assessing whether conditions currently favor a trade.
+Analyse the H1 chart and all market data below.
+{ROUND1_RULES}
 
-Review the following market data and form your independent view:
-
+MARKET DATA:
 {context}
 
-ANALYSIS GUIDELINES:
-- Focus on the H1 timeframe only
-- The structural bias is {structure} and the chart signal direction is {direction}
-- If structure and signal direction are aligned, that supports the case
-- If they conflict, that weakens the case
-- News and macro are supporting factors only — they cannot override technical structure
-- Only call NEUTRAL if technicals and fundamentals are genuinely opposed, or a high-impact event is imminent
-- Base your view on the full picture above — not any single indicator
+{"The chart image is attached. Analyse it thoroughly in your CHART ANALYSIS field." if chart_b64 else "No chart image provided — rely on numerical data only."}"""
 
-THIS IS A DIRECTION ASSESSMENT ONLY.
-Do not provide entry price, stop loss, or take profit at this stage.
-
-Respond in EXACTLY this format — no extra text:
-DIRECTION: [BUY/SELL/NEUTRAL]
-CONFIDENCE: [0-100%]
-NEWS IMPACT: [POSITIVE/NEGATIVE/NEUTRAL]
-MACRO RISK: [HIGH/MEDIUM/LOW]
-CALENDAR WARNING: [YES/NO]
-TECHNICAL VIEW: [Your reading of structure, momentum, and indicator alignment on H1]
-FUNDAMENTAL VIEW: [Your view on central bank policy, macro conditions, and sentiment for this pair]
-REASON: [2-3 sentences combining all factors into your final assessment]"""
+    # Build message content
+    content_parts = [{"type": "text", "text": prompt_text}]
+    if chart_b64:
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
+        })
 
     try:
         r = requests.post(
             OPENAI_URL,
             headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
+                "model":    "gpt-4o-mini",
+                "messages": [{"role": "user", "content": content_parts}],
                 "temperature": 0.3,
-                "max_tokens": 900
+                "max_tokens":  1400
             },
-            timeout=45
+            timeout=50
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
@@ -1220,36 +1090,178 @@ REASON: [2-3 sentences combining all factors into your final assessment]"""
 
 
 # ==========================================
-# CHATGPT — CHALLENGE GEMINI
+# CHATGPT — DECIDES: AGREE / DEBATE / NEUTRAL
+# This replaces the old static agreement check.
+# ChatGPT receives both Round 1 outputs and decides
+# whether both analyses agree, or debate is needed.
+# ==========================================
+def chatgpt_decides(symbol, price, signal, gemini_out, chatgpt_out,
+                    chart_b64=None, chart_mime="image/png"):
+    """
+    ChatGPT reviews both Round 1 analyses independently produced
+    by Gemini and ChatGPT. It decides:
+      AGREE_BUY    → both effectively agree, direction is BUY
+      AGREE_SELL   → both effectively agree, direction is SELL
+      AGREE_NEUTRAL→ both effectively agree, no trade
+      DEBATE       → genuine disagreement, debate round needed
+
+    This is more nuanced than simple string matching —
+    ChatGPT reads the reasoning of both, not just the labels.
+    """
+    if not CHATGPT_KEY:
+        return "DEBATE", "ChatGPT unavailable — defaulting to debate"
+
+    twelve   = signal.get("twelve_data", {})
+    calendar = signal.get("calendar", {})
+    context  = build_market_context(signal, {}, {}, twelve, calendar)
+    atr_td   = safe_float(twelve.get("atr"))
+    atr_ps   = safe_float(signal.get("atr"))
+    atr_use  = atr_td or atr_ps
+
+    prompt_parts = [{"type": "text", "text": f"""You are a senior execution trader reviewing two independent analyses of {symbol} H1.
+
+GEMINI ANALYSIS:
+{gemini_out}
+
+YOUR OWN ROUND 1 ANALYSIS:
+{chatgpt_out}
+
+MARKET DATA SUMMARY:
+{context}
+
+ATR (for SL/TP reference): {atr_use}
+T1 Target: {signal.get('t1_target','N/A')}
+T2 Target: {signal.get('t2_target','N/A')}
+
+{"Chart image attached for your reference." if chart_b64 else ""}
+
+━━━ YOUR TASK ━━━
+
+Review both analyses carefully. Consider:
+1. Do both agree on direction? (even if confidence differs)
+2. Does chart analysis in both match? (BOS/CHoCH/patterns)
+3. Are the hard block checks consistent?
+4. Is there a genuine analytical disagreement that needs resolution?
+
+AGREEMENT CRITERIA:
+- Both output BUY (even if one is 65% and other is 80%) → AGREE_BUY
+- Both output SELL → AGREE_SELL
+- Both output NEUTRAL → AGREE_NEUTRAL
+- One says BUY, other says SELL → DEBATE
+- One says NEUTRAL, other says directional → DEBATE (one-sided conviction)
+- Same direction but chart analysis directly contradicts numerical data → DEBATE
+
+After deciding, if AGREE_BUY or AGREE_SELL:
+Produce the final trade parameters now. SL/TP will be calculated by the system
+using ATR — you do NOT need to provide them.
+Just confirm the direction and produce your reasoning.
+
+Respond in EXACTLY this format:
+DECISION: [AGREE_BUY / AGREE_SELL / AGREE_NEUTRAL / DEBATE]
+FINAL DIRECTION: [BUY / SELL / NEUTRAL / PENDING_DEBATE]
+CONFIDENCE: [0-100]
+AGREEMENT REASON: [one sentence — why you agree or why debate is needed]
+CHART CONSENSUS: [one sentence — do both chart analyses align?]
+TECHNICAL VIEW: [2-3 sentences on the combined technical picture]
+FUNDAMENTAL VIEW: [1-2 sentences on macro/news]
+WHY THIS DECISION: [2-3 sentences — final reasoning]
+"""}]
+
+    if chart_b64:
+        prompt_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
+        })
+
+    # Web search on this decision stage if enabled
+    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH else []
+
+    try:
+        payload = {
+            "model":    "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt_parts}],
+            "temperature": 0.3,
+            "max_tokens":  1200
+        }
+        if tools:
+            payload["tools"] = tools
+
+        r = requests.post(
+            OPENAI_URL,
+            headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=60
+        )
+        r.raise_for_status()
+        resp    = r.json()
+        content = resp["choices"][0]["message"]
+
+        if isinstance(content.get("content"), list):
+            text = " ".join(b.get("text","") for b in content["content"] if b.get("type")=="text")
+        else:
+            text = content.get("content","") or ""
+
+        if not text.strip():
+            return "DEBATE", "Could not parse decision response"
+
+        # Extract decision
+        dm = re.search(r'DECISION\s*[:\-]\s*(AGREE_BUY|AGREE_SELL|AGREE_NEUTRAL|DEBATE)', text.upper())
+        decision = dm.group(1) if dm else "DEBATE"
+        return decision, text
+
+    except Exception as e:
+        print(f"chatgpt_decides error: {e}")
+        # Fallback without web search
+        try:
+            r = requests.post(
+                OPENAI_URL,
+                headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model":    "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt_parts}],
+                    "temperature": 0.3,
+                    "max_tokens":  1200
+                },
+                timeout=60
+            )
+            r.raise_for_status()
+            text     = r.json()["choices"][0]["message"]["content"]
+            dm       = re.search(r'DECISION\s*[:\-]\s*(AGREE_BUY|AGREE_SELL|AGREE_NEUTRAL|DEBATE)', text.upper())
+            decision = dm.group(1) if dm else "DEBATE"
+            return decision, text
+        except Exception as e2:
+            return "DEBATE", f"Decision error: {e2}"
+
+
+# ==========================================
+# CHATGPT — CHALLENGE GEMINI (debate round)
 # ==========================================
 def chatgpt_challenge(symbol, chatgpt_view, gemini_view):
     if not CHATGPT_KEY:
         return "CHATGPT ERROR: No API key"
-
-    prompt = f"""You are an experienced market analyst. A peer analyst (Gemini) has a different view to yours on {symbol}.
+    prompt = f"""You are a market analyst. Your peer Gemini reached a different conclusion on {symbol}.
 
 YOUR VIEW:
 {chatgpt_view}
 
-GEMINI'S VIEW:
+GEMINI VIEW:
 {gemini_view}
 
-Write a focused challenge to Gemini. Be direct and specific:
-- State the key data point or reasoning that supports your view
-- Identify the specific weakness or gap in Gemini's argument
-- Ask Gemini to justify or reconsider one specific aspect
+Write a focused 3-4 sentence challenge. Be specific:
+- Name the exact data point or pattern you disagree on
+- State the specific number or chart observation supporting your view
+- What should Gemini reconsider?
 
-Keep it under 4 sentences. Do not make a final trade call here — just challenge the logic."""
+No final call — just challenge the specific gap in reasoning."""
 
     try:
         r = requests.post(
             OPENAI_URL,
             headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "gpt-4o-mini",
+                "model":    "gpt-4o-mini",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 350
+                "temperature": 0.3, "max_tokens": 400
             },
             timeout=45
         )
@@ -1260,36 +1272,42 @@ Keep it under 4 sentences. Do not make a final trade call here — just challeng
 
 
 # ==========================================
-# GEMINI — DEFEND POSITION
+# GEMINI — DEFEND (debate round)
 # ==========================================
-def gemini_defend(signal, news, macro, gemini_first, chatgpt_challenge_msg):
+def gemini_defend(signal, news, macro, gemini_first, challenge_msg,
+                  chart_b64=None, chart_mime="image/png"):
     if not GEMINI_KEY:
         return "GEMINI UNAVAILABLE: No API key"
-
     twelve  = signal.get("twelve_data", {})
-    context = build_market_context(signal, news, macro, twelve, signal.get("calendar", {}))
+    context = build_market_context(signal, news, macro, twelve, signal.get("calendar",{}))
 
-    prompt = f"""You are an experienced market analyst defending your prior assessment.
+    prompt_text = f"""You are defending your prior analysis of {signal.get('symbol','this pair')}.
 
 YOUR ORIGINAL VIEW:
 {gemini_first}
 
-CHALLENGE FROM PEER ANALYST:
-{chatgpt_challenge_msg}
+CHALLENGE FROM PEER:
+{challenge_msg}
 
-ORIGINAL MARKET DATA (for reference):
+ORIGINAL DATA:
 {context}
 
-Respond clearly and concisely. Defend your position with specific data points from the market context above.
-If the challenge raises a valid point, acknowledge it but explain why your conclusion still holds.
+{"Chart image attached for reference." if chart_b64 else ""}
+
+Defend your position with specific data points or chart observations.
+If the challenge is valid, acknowledge it and explain why your conclusion still holds.
 Maximum 5 sentences.
 
 Respond in EXACTLY this format:
 DEFENDING DIRECTION: [BUY/SELL/NEUTRAL]
-KEY REASON 1: [strongest supporting argument]
+KEY REASON 1: [strongest data/chart point supporting your view]
 KEY REASON 2: [second supporting argument]
-KEY REASON 3: [response to the challenge specifically]
+KEY REASON 3: [direct response to the challenge]
 SUMMARY: [one sentence — your final defended stance]"""
+
+    parts = [{"text": prompt_text}]
+    if chart_b64:
+        parts.append({"inline_data": {"mime_type": chart_mime, "data": chart_b64}})
 
     for attempt in range(3):
         try:
@@ -1297,173 +1315,175 @@ SUMMARY: [one sentence — your final defended stance]"""
                 GEMINI_URL,
                 headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY},
                 json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500}
+                    "contents":       [{"parts": parts}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600}
                 },
                 timeout=30
             )
             r.raise_for_status()
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as e:
-            print(f"Gemini defend attempt {attempt+1} failed: {e}")
+            print(f"Gemini defend {attempt+1}: {e}")
             if attempt < 2:
                 time.sleep(3)
     return "GEMINI UNAVAILABLE: Could not defend"
 
 
 # ==========================================
-# CHATGPT — FINAL DECISION (ENTRY + SL + TP)
-# Called after debate OR after agreement.
-# This is the ONLY place SL/TP are produced.
+# CHATGPT — FINAL VERDICT (after debate)
+# Web search enabled here for final validation
 # ==========================================
-def chatgpt_final(symbol, price, signal, chatgpt_view, gemini_view,
-                  challenge_msg=None, gemini_defense=None, agreed=False, agreed_direction=None):
-    """
-    agreed=True  → both agreed in Round 1, skip debate recap
-    agreed=False → called after debate, include full exchange
-    SL and TP are ONLY produced here — not in Round 1.
-    """
+def chatgpt_final_verdict(symbol, price, signal, chatgpt_view, gemini_view,
+                          challenge_msg, gemini_defense,
+                          chart_b64=None, chart_mime="image/png"):
     if not CHATGPT_KEY:
         return "CHATGPT ERROR: No API key"
 
-    twelve   = signal.get("twelve_data", {})
-    calendar = signal.get("calendar", {})
-    context  = build_market_context(signal, {}, {}, twelve, calendar)
+    twelve  = signal.get("twelve_data", {})
+    calendar= signal.get("calendar", {})
+    context = build_market_context(signal, {}, {}, twelve, calendar)
+    atr_td  = safe_float(twelve.get("atr"))
+    atr_ps  = safe_float(signal.get("atr"))
+    atr_use = atr_td or atr_ps
 
-    if agreed:
-        context_block = f"""Both analysts independently assessed {agreed_direction} on {symbol}.
+    prompt_text = f"""You are a senior execution trader making the FINAL and IRREVERSIBLE decision on {symbol}.
 
-Your own Round 1 analysis:
-{chatgpt_view}
+DEBATE SUMMARY:
+Your Round 1 view: {chatgpt_view[:600]}
 
-Gemini's independent Round 1 analysis:
-{gemini_view}
+Gemini Round 1: {gemini_view[:600]}
 
-Both analyses agree. Now produce the final execution parameters."""
-    else:
-        context_block = f"""After debate, you must now make the final call on {symbol}.
+Your challenge: {challenge_msg}
 
-YOUR Round 1 analysis:
-{chatgpt_view}
+Gemini defense: {gemini_defense}
 
-GEMINI Round 1 analysis:
-{gemini_view}
-
-Your challenge to Gemini:
-{challenge_msg}
-
-Gemini's defense:
-{gemini_defense}
-
-You have heard both sides. Make the final decision."""
-
-    prompt = f"""You are a senior execution trader making the final trade decision.
-
-SYMBOL: {symbol}
-CURRENT PRICE: {price}
-TIMEFRAME: H1
-
-{context_block}
-
-MARKET DATA SUMMARY:
+MARKET DATA:
 {context}
 
-EXECUTION RULES:
-- If FINAL DIRECTION is BUY: ENTRY = {price}, SL must be below {price}, TP must be above {price}
-- If FINAL DIRECTION is SELL: ENTRY = {price}, SL must be above {price}, TP must be below {price}
-- If FINAL DIRECTION is NEUTRAL: ENTRY, STOP LOSS, TAKE PROFIT, RISK:REWARD all = N/A
-- Use ATR from the signal data for SL/TP sizing where available
-- Do not write Unknown or leave any field blank
+{"Chart image attached." if chart_b64 else ""}
 
-Respond in EXACTLY this format — no extra text:
+━━━ FINAL VALIDATION CHECKLIST ━━━
+Before deciding, verify each:
+1. Calendar: 2+ relevant events? → NEUTRAL
+2. Pivot: At R2/R3 on BUY or S2/S3 on SELL? → NEUTRAL
+3. Failed auction opposing direction? → NEUTRAL
+4. Triple exhaustion (RSI>70+Stoch>80+price>BB upper)? → NEUTRAL
+5. Chart: Does chart show CHoCH or double top/bottom opposing direction? → NEUTRAL or reverse
+6. Validator: LOW confidence + T1 < 35%? → NEUTRAL
+7. Can this trade achieve minimum 1:1.5 R:R with ATR {atr_use}? → if NO → NEUTRAL
+
+SL/TP NOTE: You do NOT need to calculate SL/TP.
+The system will use ATR {atr_use} × {SL_ATR_MULTIPLIER} for SL and × {TP_ATR_MULTIPLIER} for TP.
+Just confirm the direction.
+
+If using web search: check only for breaking news in last 4 hours affecting {symbol}.
+Do not search to confirm what you already know.
+
+Respond in EXACTLY this format:
 FINAL DIRECTION: [BUY/SELL/NEUTRAL]
-ENTRY: [{price} or N/A]
-STOP LOSS: [number or N/A]
-TAKE PROFIT: [number or N/A]
-RISK:REWARD: [1:X or N/A]
-CONFIDENCE: [0-100%]
-TECHNICAL VIEW: [key H1 technical factors driving this decision]
-FUNDAMENTAL VIEW: [key macro/news factors supporting or opposing]
-WHY THIS DECISION: [2-3 sentences — final reasoning combining both analysts' views]"""
+CONFIDENCE: [0-100]
+CHECKLIST: [which items passed / which blocked]
+CHART CONFIRMS: [YES/NO — does chart support the final direction?]
+WEB SEARCH: [YES/what found or NO]
+TECHNICAL VIEW: [2-3 sentences]
+FUNDAMENTAL VIEW: [1-2 sentences]
+WHY THIS DECISION: [2-3 sentences]"""
+
+    parts = [{"type": "text", "text": prompt_text}]
+    if chart_b64:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
+        })
+
+    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH else []
 
     try:
+        payload = {
+            "model":    "gpt-4o-mini",
+            "messages": [{"role": "user", "content": parts}],
+            "temperature": 0.3, "max_tokens": 1200
+        }
+        if tools:
+            payload["tools"] = tools
+
         r = requests.post(
             OPENAI_URL,
             headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 700
-            },
-            timeout=45
+            json=payload,
+            timeout=60
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        resp    = r.json()
+        content = resp["choices"][0]["message"]
+        if isinstance(content.get("content"), list):
+            text = " ".join(b.get("text","") for b in content["content"] if b.get("type")=="text")
+        else:
+            text = content.get("content","") or ""
+        return text or "CHATGPT FINAL ERROR: Empty response"
     except Exception as e:
-        return f"CHATGPT FINAL ERROR: {str(e)}"
+        try:
+            r = requests.post(
+                OPENAI_URL,
+                headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
+                json={"model":"gpt-4o-mini","messages":[{"role":"user","content":parts}],
+                      "temperature":0.3,"max_tokens":1200},
+                timeout=60
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception as e2:
+            return f"CHATGPT FINAL ERROR: {str(e2)}"
 
 
 # ==========================================
-# TELEGRAM MESSAGE FORMATTERS
+# TELEGRAM FORMATTERS
 # ==========================================
-def fmt_direction_line(direction):
-    if direction == "BUY":
-        return "🟢 BUY"
-    elif direction == "SELL":
-        return "🔴 SELL"
-    return "⚪ NEUTRAL"
+def fmt_dir(d):
+    return {"BUY":"🟢 BUY","SELL":"🔴 SELL"}.get(d,"⚪ NEUTRAL")
 
+def build_final_telegram(symbol, price, direction, sl, tp, rr, confidence,
+                         tech_view, fund_view, reason,
+                         chart_txt, checklist,
+                         gemini_dir, chatgpt_dir, path, session, regime=None):
+    path_tag  = {"AGREED":"✅ Both Agreed","DEBATE":"⚔️ After Debate","SOLO":"🤖 ChatGPT Only"}.get(path, path)
+    dir_line  = fmt_dir(direction)
+    su        = session.upper()
+    levels    = (f"Entry:       {price}\nStop Loss:   {sl}\nTake Profit: {tp}\nRisk:Reward: {rr}"
+                 if direction in ("BUY","SELL") else "Levels:      N/A")
+    chart_line = f"\n📊 Chart:     {chart_txt}\n" if chart_txt and chart_txt != "N/A" else ""
+    check_line = f"✔️  {checklist}\n" if checklist and checklist != "N/A" else ""
+    regime_line= f"Regime:      {regime}\n" if regime else ""
 
-def build_final_telegram(symbol, price, direction, entry, sl, tp, rr,
-                         confidence, tech_view, fund_view, reason,
-                         gemini_dir, chatgpt_dir, path, session):
-    """
-    Builds the clean final Telegram message.
-    path: "AGREED" / "DEBATE" / "SOLO"
-    """
-    dir_line  = fmt_direction_line(direction)
-    path_tag  = {"AGREED": "✅ Both Agreed", "DEBATE": "⚔️ After Debate", "SOLO": "🤖 ChatGPT Only"}.get(path, path)
-    session_u = session.upper()
-
-    sl_rr_line = (
-        f"Entry:       {entry}\n"
-        f"Stop Loss:   {sl}\n"
-        f"Take Profit: {tp}\n"
-        f"Risk:Reward: {rr}"
-    ) if direction in ("BUY", "SELL") else "Levels:      N/A"
-
-    msg = f"""{dir_line} | {symbol} | {session_u}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-Decision:    {path_tag}
-Confidence:  {confidence}
-Gemini:      {gemini_dir}  |  ChatGPT: {chatgpt_dir}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-{sl_rr_line}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 TECHNICAL:
-{tech_view}
-
-🌐 FUNDAMENTAL:
-{fund_view}
-
-🎯 REASON:
-{reason}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-Price: {price} | H1 | {datetime.now(timezone.utc).strftime('%H:%M UTC')}"""
-    return msg
-
+    return (
+        f"{dir_line} | {symbol} | {su}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Decision:    {path_tag}\n"
+        f"Confidence:  {confidence}\n"
+        f"Gemini:      {gemini_dir}  |  ChatGPT: {chatgpt_dir}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{levels}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{chart_line}"
+        f"{check_line}"
+        f"{regime_line}"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 TECHNICAL:\n{tech_view}\n\n"
+        f"🌐 FUNDAMENTAL:\n{fund_view}\n\n"
+        f"🎯 REASON:\n{reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Price: {price} | H1 | {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+    )
 
 def send_neutral(symbol, confidence, reason, session, gemini_dir, chatgpt_dir):
-    session_u = session.upper() if session != "off" else "SESSION"
+    su = session.upper() if session != "off" else "SESSION"
     send_telegram(
-        f"⚪ NEUTRAL | {symbol} | {session_u}\n"
+        f"⚪ NEUTRAL | {symbol} | {su}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Gemini: {gemini_dir}  |  ChatGPT: {chatgpt_dir}\n"
         f"Confidence: {confidence}\n"
         f"Reason: {reason}"
     )
-
 
 def send_neutral_audit(symbol, gemini_text, chatgpt_text, reason, post_debate=False):
     label = "NEUTRAL AUDIT (Post-Debate)" if post_debate else "NEUTRAL AUDIT"
@@ -1472,440 +1492,397 @@ def send_neutral_audit(symbol, gemini_text, chatgpt_text, reason, post_debate=Fa
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Reason: {reason}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"GEMINI VIEW:\n{gemini_text[:500]}\n"
+        f"GEMINI:\n{str(gemini_text)[:500]}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"CHATGPT VIEW:\n{chatgpt_text[:500]}"
+        f"CHATGPT:\n{str(chatgpt_text)[:500]}"
     )
 
 
 # ==========================================
-# WEBHOOK — MAIN PIPELINE
+# FINAL OUTPUT HANDLER (shared by all paths)
 # ==========================================
-@app.route("/webhook", methods=["POST", "GET"])
+def _send_trade(symbol, price, direction, signal, twelve_data,
+                gemini_dir, chatgpt_dir, path, session,
+                decision_text, calendar, post_debate=False):
+    """
+    Extracts fields from decision text, calculates SL/TP in Python,
+    validates, and sends final Telegram message.
+    """
+    final_dir = extract_direction(decision_text)
+
+    if final_dir == "NEUTRAL":
+        reason = extract_neutral_reason(decision_text, "", calendar, signal)
+        conf   = extract_confidence(decision_text)
+        send_neutral(symbol, conf, reason, session, gemini_dir, chatgpt_dir)
+        send_neutral_audit(symbol, gemini_dir, decision_text, reason, post_debate=post_debate)
+        update_neutral_cache(symbol, session, "NEUTRAL", signal, twelve_data)
+        return False
+
+    # Calculate SL/TP deterministically from ATR
+    atr_td  = safe_float(twelve_data.get("atr"))
+    atr_ps  = safe_float(signal.get("atr"))
+    atr_use = atr_td or atr_ps
+    sl, tp, rr = calculate_sl_tp(final_dir, price, atr_use)
+
+    # Validate
+    valid, v_msg = validate_levels(final_dir, price, sl, tp)
+    if not valid:
+        send_telegram(
+            f"⚠️ SL/TP INVALID | {symbol}\n"
+            f"Direction: {final_dir} | Price: {price}\n"
+            f"SL: {sl} | TP: {tp}\n"
+            f"Issue: {v_msg}\nSignal aborted."
+        )
+        return False
+
+    conf      = extract_confidence(decision_text)
+    tech      = extract_multiline_field(decision_text, "TECHNICAL VIEW")
+    fund      = extract_multiline_field(decision_text, "FUNDAMENTAL VIEW")
+    reason    = extract_multiline_field(decision_text, "WHY THIS DECISION")
+    if reason == "N/A":
+        reason = extract_multiline_field(decision_text, "REASON")
+    chart_txt = extract_multiline_field(decision_text, "CHART ANALYSIS")
+    if chart_txt == "N/A":
+        chart_txt = extract_multiline_field(decision_text, "CHART CONFIRMS")
+    checklist = extract_multiline_field(decision_text, "CHECKLIST")
+
+    adx_v   = safe_float(twelve_data.get("adx"))
+    bb_w    = twelve_data.get("bb_width")
+    regime  = detect_market_regime(adx_v, bb_w)
+
+    msg = build_final_telegram(
+        symbol, price, final_dir, sl, tp, rr, conf,
+        tech, fund, reason, chart_txt, checklist,
+        gemini_dir, chatgpt_dir, path, session, regime
+    )
+    send_telegram(msg)
+    register_trade(symbol, session)
+    update_neutral_cache(symbol, session, final_dir, signal, twelve_data)
+    return True
+
+
+# ==========================================
+# MAIN WEBHOOK
+# ==========================================
+@app.route("/webhook", methods=["POST","GET"])
 def webhook():
     if request.method == "GET":
-        return "Webhook active. POST trading signals to /webhook", 200
+        return "Webhook active. POST signals to /webhook", 200
 
     try:
-        request_json = request.get_json(silent=True, force=True)
-        request_text = request.get_data(as_text=True)
-        print(f"Incoming: {request_text[:300]}")
+        rj   = request.get_json(silent=True, force=True)
+        rt   = request.get_data(as_text=True)
+        print(f"Incoming: {rt[:300]}")
+        data = parse_incoming_data(rj, rt)
 
-        data = parse_incoming_data(request_json, request_text)
         if not data:
-            send_telegram("❌ No parseable data received from TradingView")
+            send_telegram("❌ No parseable data from TradingView")
             return "No data", 400
 
-        # ── Field Extraction ─────────────────────────────────────────
-        symbol    = clean_symbol(safe_str(data.get("symbol") or data.get("ticker"), "Unknown"))
-        price     = safe_float(data.get("price") or data.get("close") or 0)
-        raw_tf    = safe_str(data.get("tf") or data.get("timeframe") or data.get("interval"), "1H")
-        data["tf"] = "1H"
-        data["timeframe"] = "1H"
+        # ── Field Extraction ─────────────────────────────────────
+        symbol     = clean_symbol(safe_str(data.get("symbol") or data.get("ticker"), "Unknown"))
+        price_raw  = safe_float(data.get("price") or data.get("close") or 0, allow_zero=False)
+        price      = price_raw if price_raw else 0.0
+        data["tf"] = data["timeframe"] = "1H"
 
         direction  = safe_str(data.get("direction"), "N/A")
-        score      = safe_str(data.get("score"), "N/A")
-        adx        = safe_str(data.get("adx"), "N/A")
-        structure  = safe_str(data.get("structure_bias") or data.get("structure"), "N/A")
-        atr        = safe_str(data.get("atr"), "N/A")
-        ema_21     = safe_str(data.get("ema_21"), "N/A")
-        ema_50     = safe_str(data.get("ema_50"), "N/A")
-        ema_200    = safe_str(data.get("ema_200"), "N/A")
+        score      = safe_str(data.get("score"),     "N/A")
+        adx        = safe_str(data.get("adx"),       "N/A")
+        structure  = safe_str(data.get("structure_bias"), "N/A")
+        atr        = safe_str(data.get("atr"),       "N/A")
+        ema_21     = safe_str(data.get("ema_21"),    "N/A")
+        ema_50     = safe_str(data.get("ema_50"),    "N/A")
+        ema_200    = safe_str(data.get("ema_200"),   "N/A")
         volume     = safe_str(data.get("volume_ratio"), "N/A")
-        validator  = safe_str(data.get("validator"), "N/A")
-        confidence = safe_str(data.get("confidence"), "N/A")
         signal_ea  = safe_int(data.get("ea_score") or data.get("ea_filter") or 0)
+        sv_conf    = safe_str(data.get("sv_confidence"), "N/A")
+        sv_valid   = safe_str(data.get("sv_valid"),  "N/A")
+        pivot_zone = safe_str(data.get("pivot_zone"),"N/A")
+        vwap_band  = safe_str(data.get("vwap_band"), "N/A")
 
-        print(f"{symbol} | {price} | {direction} | Score:{score} | EA:{signal_ea}")
+        # Normalize bool fields
+        data["lon_fail_up"]   = safe_bool(data.get("lon_fail_up"))
+        data["lon_fail_down"] = safe_bool(data.get("lon_fail_down"))
+        data["ny_fail_up"]    = safe_bool(data.get("ny_fail_up"))
+        data["ny_fail_down"]  = safe_bool(data.get("ny_fail_down"))
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 1 — SESSION & FREQUENCY CHECK
-        # Validates: trading hours, max 2 trades/session, 2hr cooldown
-        # ══════════════════════════════════════════════════════════════
+        # Chart image — fetch from URL in alert payload
+        chart_url  = data.get("chart_url") or data.get("chart_image_url") or data.get("chart_screenshot")
+        chart_b64  = fetch_chart_image(chart_url) if chart_url else None
+        chart_mime = get_image_mime(chart_url) if chart_url else "image/png"
+        chart_info = "✅ Chart attached" if chart_b64 else "⚠️ No chart image"
+
+        print(f"{symbol} | {price} | {direction} | Score:{score} | EA:{signal_ea} | Chart:{chart_info}")
+
+        # ══════════════════════════════════════════════════════
+        # GATE 1 — SESSION & FREQUENCY
+        # ══════════════════════════════════════════════════════
         allowed, gate_reason, session = session_gate(symbol)
         if not allowed:
             if session == "off":
-                # ── OFF-SESSION: accumulate qualifying signals silently ──
-                # Pine Script already enforced score/EA thresholds before
-                # firing the alert — no additional filtering needed here.
                 store_off_session_signal(
                     symbol, direction,
                     safe_int(data.get("score") or 0),
                     signal_ea, price
                 )
-                # Individual off-session signals are always silent —
-                # summaries are sent at 09:00 and 11:59 by the scheduler.
             else:
-                # Session cooldown or trade limit — send notification
                 send_telegram(
                     f"🚫 SIGNAL BLOCKED | {symbol} | {session.upper()}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Price:      {price}\n"
-                    f"Direction:  {direction}\n"
-                    f"Score:      {score}/100\n"
-                    f"EA Filter:  {signal_ea}/8\n"
+                    f"Price: {price}  Direction: {direction}\n"
+                    f"Score: {score}/100  EA: {signal_ea}/8\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"Reason: {gate_reason}"
                 )
             return "Blocked", 200
 
-        # ── Signal received ──────────────────────────────────────────
+        # ── Signal In ─────────────────────────────────────────
         send_telegram(
             f"📡 SIGNAL IN | {symbol} | {session.upper()}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Price:      {price}     ATR: {atr}\n"
-            f"Direction:  {direction}    Score: {score}/100\n"
-            f"Structure:  {structure}    ADX: {adx}\n"
-            f"EA Filter:  {signal_ea}/8      Volume: {volume}\n"
-            f"EMA:        {ema_21} / {ema_50} / {ema_200}\n"
-            f"Validator:  {validator}\n"
+            f"Price:{price}  ATR:{atr}  Score:{score}/100\n"
+            f"Dir:{direction}  Struct:{structure}  ADX:{adx}\n"
+            f"EA:{signal_ea}/8  Vol:{volume}\n"
+            f"EMA:{ema_21}/{ema_50}/{ema_200}\n"
+            f"Pivot:{pivot_zone}  VWAP:{vwap_band}\n"
+            f"Validator:{sv_valid} ({sv_conf})\n"
+            f"Chart: {chart_info}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Fetching market data..."
+            f"⏳ Fetching live data..."
         )
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 2 — PARALLEL LIVE DATA FETCH
-        # Runs Finnhub + GDELT + Calendar simultaneously
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        # GATE 2 — PARALLEL DATA FETCH
+        # ══════════════════════════════════════════════════════
         news, macro, calendar = fetch_all_live_data(symbol)
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 3 — TWELVE DATA (sequential, rate-limited)
-        # Quality flag added: FULL / PARTIAL / POOR
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        # GATE 2.5 — CURRENCY-SPECIFIC CALENDAR HARD BLOCK
+        # Only blocks if this pair's currencies have 2+ events
+        # ══════════════════════════════════════════════════════
+        sc          = clean_symbol(symbol)
+        currencies  = [sc[:3], sc[3:]] if len(sc) == 6 else [sc]
+        events_raw  = calendar.get("events", [])
+        rel_events  = []
+        for e in events_raw:
+            if isinstance(e, dict) and e.get("currency","") in currencies:
+                rel_events.append(e.get("event",""))
+            elif isinstance(e, str):
+                rel_events.append(e)   # fallback if event is just a string
+
+        if len(rel_events) >= 2:
+            send_telegram(
+                f"🚫 CALENDAR BLOCK | {symbol} | {session.upper()}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Relevant events for {'/'.join(currencies)}: {len(rel_events)}\n"
+                f"Events: {', '.join(rel_events)}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Do not trade during currency-specific high-impact events."
+            )
+            return "Calendar block", 200
+
+        # ══════════════════════════════════════════════════════
+        # GATE 3 — TWELVE DATA
+        # ══════════════════════════════════════════════════════
         twelve_data = fetch_twelve_data(symbol)
         data["twelve_data"] = twelve_data
         data["calendar"]    = calendar
+        tq  = twelve_data.get("_quality","Unknown")
+        adx_v  = safe_float(twelve_data.get("adx"))
+        bb_w   = twelve_data.get("bb_width")
+        regime = detect_market_regime(adx_v, bb_w)
 
-        twelve_quality = twelve_data.get("_quality", "Unknown")
-        cal_line = (
-            f"⚠️ HIGH IMPACT: {', '.join(calendar.get('events', []))}"
-            if calendar.get("high_impact_soon") else "Calendar: Clear"
-        )
-
+        cal_ev_names = ", ".join(rel_events) if rel_events else "Clear"
         send_telegram(
             f"📊 MARKET DATA | {symbol}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"News:      {news['sentiment']} ({len(news.get('headlines', []))} headlines)\n"
-            f"Macro:     {macro['risk']}\n"
-            f"{cal_line}\n"
+            f"News:{news['sentiment']}  Macro:{macro['risk']}\n"
+            f"Calendar: {cal_ev_names}\n"
+            f"Regime: {regime}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"INDICATORS ({twelve_quality}):\n"
-            f"RSI: {twelve_data.get('rsi','N/A')}  "
-            f"MACD: {twelve_data.get('macd','N/A')}  "
-            f"CCI: {twelve_data.get('cci','N/A')}\n"
-            f"Stoch: {twelve_data.get('stoch_k','N/A')}/{twelve_data.get('stoch_d','N/A')}  "
-            f"MFI: {twelve_data.get('mfi','N/A')}  "
-            f"WR: {twelve_data.get('willr','N/A')}\n"
-            f"Aroon: {twelve_data.get('aroon_up','N/A')}↑ {twelve_data.get('aroon_down','N/A')}↓  "
-            f"PSAR: {twelve_data.get('psar','N/A')}\n"
+            f"INDICATORS ({tq}):\n"
+            f"RSI:{twelve_data.get('rsi','N/A')}  "
+            f"MACD:{twelve_data.get('macd','N/A')}  "
+            f"Hist:{twelve_data.get('macd_histogram','N/A')}\n"
+            f"Stoch:{twelve_data.get('stoch_k','N/A')}/{twelve_data.get('stoch_d','N/A')}  "
+            f"ADX:{twelve_data.get('adx','N/A')}  ATR:{twelve_data.get('atr','N/A')}\n"
+            f"BB:{twelve_data.get('bb_lower','N/A')}/{twelve_data.get('bb_middle','N/A')}/{twelve_data.get('bb_upper','N/A')}  W:{bb_w}%\n"
+            f"Ichi Conv/Base:{twelve_data.get('ichimoku_conversion','N/A')}/{twelve_data.get('ichimoku_base','N/A')}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Checking market change score..."
+            f"⏳ MCS check..."
         )
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 3.5 — MARKET CHANGE SCORE (MCS) — AUTO-NEUTRAL FILTER
-        #
-        # Compares current signal to the last cached signal for this pair.
-        # If market conditions have not changed enough since the last
-        # NEUTRAL outcome, skip AI entirely and auto-fire neutral.
-        #
-        # Zero AI tokens consumed. Response in <100ms instead of 30s.
-        #
-        # Veto conditions that ALWAYS bypass this gate and run AI:
-        #   - No previous neutral cached for this pair/session
-        #   - Last outcome was a BUY or SELL (not neutral)
-        #   - Cache is older than CACHE_EXPIRY_MINUTES (default 30m)
-        #   - High-impact calendar event detected
-        #   - Price moved more than PRICE_VETO_PCT (default 0.30%)
-        #   - Auto-neutral streak >= MAX_AUTO_NEUTRAL_STREAK (default 4)
-        #   - MCS >= MCS_THRESHOLD (default 15.0%)
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        # GATE 3.5 — MCS AUTO-NEUTRAL
+        # ══════════════════════════════════════════════════════
         skip_ai, mcs_reason, mcs_score = should_auto_neutral(
             symbol, session, data, twelve_data, calendar
         )
-
         if skip_ai:
-            # ── AUTO-NEUTRAL: no AI calls, instant response ──────────
-            session_u = session.upper()
-            cached_key = f"{clean_symbol(symbol)}_{session}"
-            streak = neutral_cache.get(cached_key, {}).get("auto_count", 0) + 1
-
+            with cache_lock:
+                streak = neutral_cache.get(f"{sc}_{session}",{}).get("auto_count",0) + 1
             send_telegram(
-                f"⚪ NEUTRAL | {symbol} | {session_u}\n"
+                f"⚪ NEUTRAL | {symbol} | {session.upper()}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Mode:       Auto (no AI)\n"
-                f"MCS:        {mcs_score:.1f}% (threshold: {MCS_THRESHOLD}%)\n"
-                f"Streak:     {streak}/{MAX_AUTO_NEUTRAL_STREAK}\n"
-                f"Reason:     {mcs_reason}"
+                f"Mode:    Auto (no AI)\n"
+                f"MCS:     {mcs_score:.1f}% (threshold: {MCS_THRESHOLD}%)\n"
+                f"Streak:  {streak}/{MAX_AUTO_NEUTRAL_STREAK}\n"
+                f"Reason:  {mcs_reason}"
             )
-
-            # Update cache — increment streak
             update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
             increment_auto_streak(symbol, session)
             return "OK", 200
 
-        # MCS gate cleared — reset streak and run full AI pipeline
         reset_auto_streak(symbol, session)
-
         send_telegram(
-            f"🔄 MCS: {mcs_score:.1f}% ≥ {MCS_THRESHOLD}% | {mcs_reason}\n"
-            f"⏳ Running independent AI analysis..."
+            f"🔄 MCS: {mcs_score:.1f}% — Running AI analysis...\n"
+            f"{'🖼️ Chart image will be analysed by both AIs' if chart_b64 else '⚠️ No chart — numerical analysis only'}"
         )
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 4 — PARALLEL INDEPENDENT AI ANALYSIS (Round 1)
-        # Gemini and ChatGPT run simultaneously and BLINDLY
-        # Neither receives the other's output in this round
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        # GATE 4 — BLIND PARALLEL AI ROUND 1
+        # Both receive data context + chart image independently
+        # ══════════════════════════════════════════════════════
         with ThreadPoolExecutor(max_workers=2) as ex:
-            fg = ex.submit(gemini_analysis, data, news, macro)
-            fc = ex.submit(chatgpt_analysis, symbol, price, data, news, macro, calendar)
+            fg = ex.submit(gemini_analysis, data, news, macro, chart_b64, chart_mime)
+            fc = ex.submit(chatgpt_analysis, symbol, price, data, news, macro,
+                           calendar, chart_b64, chart_mime)
             gemini  = fg.result()
             chatgpt = fc.result()
 
-        # Handle total AI failure
         if "GEMINI UNAVAILABLE" in gemini and "CHATGPT ERROR" in chatgpt:
             send_telegram(f"❌ Both AI systems failed for {symbol}. Signal aborted.")
             return "AI failure", 500
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 5 — DIRECTION PARSING (regex label-only extraction)
-        # Prevents "do NOT BUY" from being parsed as BUY
-        # ══════════════════════════════════════════════════════════════
         gemini_dir  = extract_direction(gemini)  if "GEMINI UNAVAILABLE" not in gemini  else "UNAVAILABLE"
         chatgpt_dir = extract_direction(chatgpt) if "CHATGPT ERROR"      not in chatgpt else "UNAVAILABLE"
+        print(f"R1 — Gemini: {gemini_dir} | ChatGPT: {chatgpt_dir}")
 
-        print(f"Directions — Gemini: {gemini_dir} | ChatGPT: {chatgpt_dir}")
-
-        # ── Gemini-only fallback ─────────────────────────────────────
+        # ChatGPT down — cannot proceed
         if "CHATGPT ERROR" in chatgpt:
-            send_telegram(f"⚠️ ChatGPT unavailable. Gemini-only analysis for {symbol}.")
-            # Cannot produce SL/TP without ChatGPT final — abort
-            send_telegram(f"❌ Cannot produce execution parameters without ChatGPT. Signal skipped.")
+            send_telegram(f"❌ ChatGPT unavailable — cannot produce final decision. Skipped.")
             return "ChatGPT unavailable", 200
 
-        # ── Gemini unavailable — ChatGPT solo ───────────────────────
+        # Gemini down — ChatGPT solo (no debate possible)
         if "GEMINI UNAVAILABLE" in gemini:
-            send_telegram(f"⚠️ Gemini unavailable. Proceeding with ChatGPT only.")
+            send_telegram(f"⚠️ Gemini unavailable — ChatGPT solo analysis.")
             gemini_dir = "UNAVAILABLE"
-
-            if chatgpt_dir in ("BUY", "SELL"):
-                final_out = chatgpt_final(
-                    symbol, price, data, chatgpt, "Gemini unavailable",
-                    agreed=True, agreed_direction=chatgpt_dir
-                )
-                final_dir = extract_direction(final_out)
-                sl = extract_sl(final_out)
-                tp = extract_tp(final_out)
-                rr = extract_rr(final_out)
-                conf = extract_confidence(final_out)
-                tech = extract_multiline_field(final_out, "TECHNICAL VIEW")
-                fund = extract_multiline_field(final_out, "FUNDAMENTAL VIEW")
-                reason = extract_multiline_field(final_out, "WHY THIS DECISION")
-
-                sl_valid, sl_msg = validate_levels(final_dir, price, sl, tp)
-                if not sl_valid:
-                    send_telegram(f"⚠️ SL/TP INVALID ({symbol}): {sl_msg}\nSignal aborted.")
-                    return "Invalid levels", 200
-
-                msg = build_final_telegram(
-                    symbol, price, final_dir, price, sl, tp, rr,
-                    conf, tech, fund, reason,
-                    "N/A", chatgpt_dir, "SOLO", session
-                )
-                send_telegram(msg)
-                register_trade(symbol, session)
+            if chatgpt_dir in ("BUY","SELL"):
+                _send_trade(symbol, price, chatgpt_dir, data, twelve_data,
+                            "UNAVAILABLE", chatgpt_dir, "SOLO", session,
+                            chatgpt, calendar)
             else:
-                reason = extract_neutral_reason(gemini, chatgpt, calendar)
+                reason = extract_neutral_reason(gemini, chatgpt, calendar, data)
                 conf   = extract_confidence(chatgpt)
                 send_neutral(symbol, conf, reason, session, "UNAVAILABLE", chatgpt_dir)
                 send_neutral_audit(symbol, "UNAVAILABLE", chatgpt, reason)
                 update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
             return "OK", 200
 
-        # ══════════════════════════════════════════════════════════════
-        # GATE 6 — AGREEMENT CHECK
-        # NEUTRAL requires BOTH to agree → only then skip trade
-        # One NEUTRAL → soft disagreement → enters debate
-        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
+        # GATE 5 — CHATGPT DECIDES: AGREE / DEBATE / NEUTRAL
+        # ChatGPT reads both Round 1 outputs and decides.
+        # More intelligent than simple string matching.
+        # ══════════════════════════════════════════════════════
+        send_telegram(
+            f"🔍 AI ROUND 1 COMPLETE | {symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Gemini:  {gemini_dir}\n"
+            f"ChatGPT: {chatgpt_dir}\n"
+            f"ChatGPT reviewing both analyses..."
+        )
 
-        # ── Case A: BOTH NEUTRAL ─────────────────────────────────────
-        if gemini_dir == "NEUTRAL" and chatgpt_dir == "NEUTRAL":
-            reason = extract_neutral_reason(gemini, chatgpt, calendar)
-            conf   = extract_confidence(chatgpt)
+        decision, decision_text = chatgpt_decides(
+            symbol, price, data, gemini, chatgpt, chart_b64, chart_mime
+        )
+        print(f"ChatGPT decision: {decision}")
+
+        # ── AGREE_NEUTRAL ─────────────────────────────────────
+        if decision == "AGREE_NEUTRAL":
+            reason = extract_neutral_reason(gemini, chatgpt, calendar, data)
+            conf   = extract_confidence(decision_text)
             send_neutral(symbol, conf, reason, session, gemini_dir, chatgpt_dir)
             send_neutral_audit(symbol, gemini, chatgpt, reason)
             update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
             return "OK", 200
 
-        # ── Case B: FULL AGREEMENT (BUY+BUY or SELL+SELL) ────────────
-        elif gemini_dir == chatgpt_dir and gemini_dir in ("BUY", "SELL"):
-            agreed_dir = gemini_dir
+        # ── AGREE_BUY or AGREE_SELL ───────────────────────────
+        elif decision in ("AGREE_BUY","AGREE_SELL"):
+            final_dir = "BUY" if decision == "AGREE_BUY" else "SELL"
             send_telegram(
                 f"✅ AGREEMENT | {symbol}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Gemini:  {gemini_dir}\n"
-                f"ChatGPT: {chatgpt_dir}\n"
-                f"Both agree independently. Producing execution parameters..."
+                f"Decision: {final_dir}\n"
+                f"Gemini: {gemini_dir}  |  ChatGPT: {chatgpt_dir}\n"
+                f"Producing execution parameters..."
             )
-
-            # ════════════════════════════════════════════════════════
-            # GATE 7 — FINAL EXECUTION (SL/TP ONLY HERE)
-            # ════════════════════════════════════════════════════════
-            final_out = chatgpt_final(
-                symbol, price, data, chatgpt, gemini,
-                agreed=True, agreed_direction=agreed_dir
-            )
-            final_dir = extract_direction(final_out)
-            sl   = extract_sl(final_out)
-            tp   = extract_tp(final_out)
-            rr   = extract_rr(final_out)
-            conf = extract_confidence(final_out)
-            tech = extract_multiline_field(final_out, "TECHNICAL VIEW")
-            fund = extract_multiline_field(final_out, "FUNDAMENTAL VIEW")
-            reason = extract_multiline_field(final_out, "WHY THIS DECISION")
-
-            # ════════════════════════════════════════════════════════
-            # GATE 8 — SL/TP SANITY VALIDATION
-            # Confirms levels are on correct side of entry
-            # ════════════════════════════════════════════════════════
-            sl_valid, sl_msg = validate_levels(final_dir, price, sl, tp)
-            if not sl_valid:
-                send_telegram(
-                    f"⚠️ SL/TP INVALID | {symbol}\n"
-                    f"Direction: {final_dir} | Entry: {price}\n"
-                    f"SL: {sl} | TP: {tp}\n"
-                    f"Issue: {sl_msg}\n"
-                    f"Signal aborted."
-                )
-                return "Invalid levels", 200
-
-            gemini_tech  = extract_multiline_field(gemini, "TECHNICAL VIEW")
-            chatgpt_tech = extract_multiline_field(chatgpt, "TECHNICAL VIEW")
-            combined_tech = f"Gemini: {gemini_tech}\nChatGPT: {chatgpt_tech}"
-
-            msg = build_final_telegram(
-                symbol, price, final_dir, price, sl, tp, rr,
-                conf, combined_tech, fund, reason,
-                gemini_dir, chatgpt_dir, "AGREED", session
-            )
-            send_telegram(msg)
-            register_trade(symbol, session)
-            update_neutral_cache(symbol, session, final_dir, data, twelve_data)
+            _send_trade(symbol, price, final_dir, data, twelve_data,
+                        gemini_dir, chatgpt_dir, "AGREED", session,
+                        decision_text, calendar)
             return "OK", 200
 
-        # ── Case C: DISAGREEMENT or ONE NEUTRAL ──────────────────────
+        # ── DEBATE ────────────────────────────────────────────
         else:
             send_telegram(
                 f"⚔️ DEBATE | {symbol}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Gemini:  {gemini_dir}\n"
-                f"ChatGPT: {chatgpt_dir}\n"
-                f"Initiating debate round..."
+                f"Gemini: {gemini_dir}  |  ChatGPT: {chatgpt_dir}\n"
+                f"ChatGPT challenging Gemini..."
             )
 
-            # ════════════════════════════════════════════════════════
-            # GATE 9 — DEBATE ROUND
-            # ChatGPT challenges → Gemini defends → ChatGPT final verdict
-            # ════════════════════════════════════════════════════════
+            # ════════════════════════════════════════════════
+            # GATE 6 — DEBATE ROUND
+            # ════════════════════════════════════════════════
             challenge    = chatgpt_challenge(symbol, chatgpt, gemini)
-            gemini_reply = gemini_defend(data, news, macro, gemini, challenge)
+            gemini_reply = gemini_defend(data, news, macro, gemini, challenge,
+                                         chart_b64, chart_mime)
 
-            # Final decision after debate — SL/TP produced here
-            final_out = chatgpt_final(
+            send_telegram(
+                f"💬 DEBATE COMPLETE | {symbol}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Challenge and defense exchanged.\n"
+                f"ChatGPT making final verdict..."
+            )
+
+            final_text = chatgpt_final_verdict(
                 symbol, price, data, chatgpt, gemini,
-                challenge_msg=challenge,
-                gemini_defense=gemini_reply,
-                agreed=False
+                challenge, gemini_reply, chart_b64, chart_mime
             )
-            final_dir = extract_direction(final_out)
 
-            # ════════════════════════════════════════════════════════
-            # GATE 10 — POST-DEBATE NEUTRAL
-            # ════════════════════════════════════════════════════════
-            if final_dir == "NEUTRAL":
-                reason = extract_neutral_reason(gemini, chatgpt, calendar)
-                conf   = extract_confidence(final_out)
-                send_neutral(symbol, conf, reason, session, gemini_dir, chatgpt_dir)
-                send_neutral_audit(symbol, gemini, chatgpt, reason, post_debate=True)
-                update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
-                return "OK", 200
-
-            sl   = extract_sl(final_out)
-            tp   = extract_tp(final_out)
-            rr   = extract_rr(final_out)
-            conf = extract_confidence(final_out)
-            tech = extract_multiline_field(final_out, "TECHNICAL VIEW")
-            fund = extract_multiline_field(final_out, "FUNDAMENTAL VIEW")
-            reason = extract_multiline_field(final_out, "WHY THIS DECISION")
-
-            # ════════════════════════════════════════════════════════
-            # GATE 11 — SL/TP VALIDATION (post-debate)
-            # ════════════════════════════════════════════════════════
-            sl_valid, sl_msg = validate_levels(final_dir, price, sl, tp)
-            if not sl_valid:
-                send_telegram(
-                    f"⚠️ SL/TP INVALID (Post-Debate) | {symbol}\n"
-                    f"Direction: {final_dir} | Entry: {price}\n"
-                    f"SL: {sl} | TP: {tp}\n"
-                    f"Issue: {sl_msg}\n"
-                    f"Signal aborted."
-                )
-                return "Invalid levels", 200
-
-            msg = build_final_telegram(
-                symbol, price, final_dir, price, sl, tp, rr,
-                conf, tech, fund, reason,
-                gemini_dir, chatgpt_dir, "DEBATE", session
-            )
-            send_telegram(msg)
-            register_trade(symbol, session)
-            update_neutral_cache(symbol, session, final_dir, data, twelve_data)
+            _send_trade(symbol, price, "PENDING", data, twelve_data,
+                        gemini_dir, chatgpt_dir, "DEBATE", session,
+                        final_text, calendar, post_debate=True)
             return "OK", 200
 
     except Exception as e:
-        error_msg = f"ERROR: {str(e)[:200]}"
-        print(error_msg)
-        send_telegram(f"❌ System Error | {error_msg}")
-        return error_msg, 500
+        err = f"ERROR: {str(e)[:200]}"
+        print(err)
+        send_telegram(f"❌ System Error | {err}")
+        return err, 500
 
 
 # ==========================================
-# HEALTH CHECK
+# HEALTH & ROUTES
 # ==========================================
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-
 @app.route("/", methods=["GET"])
 def root():
-    return "Trading Bot running. POST signals to /webhook", 200
+    return "MIKA Bot running. POST signals to /webhook", 200
 
 
+# ==========================================
+# STARTUP
+# ==========================================
 if __name__ == "__main__":
-    # ── Off-session snapshot scheduler ──────────────────────
-    # Fires two fixed-time summaries daily in PKT (UTC+5):
-    #   09:00 PKT → overnight short summary  (UTC 04:00)
-    #   11:59 PKT → pre-session full brief   (UTC 06:59)
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(
-        send_presession_snapshot,
-        "cron",
-        hour=4, minute=0,        # 09:00 PKT = 04:00 UTC
-        args=["overnight"],
-        id="overnight_snapshot"
-    )
-    scheduler.add_job(
-        send_presession_snapshot,
-        "cron",
-        hour=6, minute=59,       # 11:59 PKT = 06:59 UTC
-        args=["presession"],
-        id="presession_brief"
-    )
+    scheduler.add_job(send_presession_snapshot, "cron",
+                      hour=4, minute=0, args=["overnight"], id="overnight")
+    scheduler.add_job(send_presession_snapshot, "cron",
+                      hour=6, minute=59, args=["presession"], id="presession")
     scheduler.start()
-    print("Scheduler started: snapshots at 09:00 and 11:59 PKT daily")
-
+    print("Scheduler started: 09:00 and 11:59 PKT daily")
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
