@@ -1620,6 +1620,10 @@ def webhook():
         allowed, gate_reason, session = session_gate(symbol)
         if not allowed:
             if session == "off":
+                # ADD THIS ONE-LINE MESSAGE
+                send_telegram(
+                    f"⏸️ OFF-SESSION | {symbol} | {direction} | Score:{score} | EA:{signal_ea}"
+                )
                 store_off_session_signal(
                     symbol, direction,
                     safe_int(data.get("score") or 0),
