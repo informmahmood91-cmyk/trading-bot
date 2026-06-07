@@ -289,30 +289,87 @@ def detect_market_regime(adx, bb_width=None):
 # ==========================================
 def fetch_chart_image(chart_url):
     """
-    Fetches chart image from URL and converts to base64.
-    Supports: TradingView published chart URLs, direct image URLs.
+    Extract symbol and interval from TradingView URL,
+    then fetch chart image from chart-img.com API.
     Returns base64 string or None if failed.
     """
+    import re
+    
+    api_key = os.environ.get("CHART_IMG_API_KEY")
+    
+    # If no API key, return None (no chart vision)
+    if not api_key:
+        print("No CHART_IMG_API_KEY - chart vision disabled")
+        return None
+    
+    # If no URL provided, return None
     if not chart_url or not isinstance(chart_url, str):
         return None
+    
+    # ── STEP 1: Extract symbol and interval from TradingView URL ──
+    symbol = None
+    interval = "60"  # default 1H
+    
+    # Extract symbol: symbol=BTCUSD
+    symbol_match = re.search(r'symbol=([^&]+)', chart_url)
+    if symbol_match:
+        symbol = symbol_match.group(1)
+    
+    # Extract interval: interval=60
+    interval_match = re.search(r'interval=(\d+)', chart_url)
+    if interval_match:
+        interval = interval_match.group(1)
+    
+    if not symbol:
+        print(f"Could not extract symbol from URL: {chart_url[:100]}")
+        return None
+    
+    # Clean symbol for API (remove exchange prefixes if any)
+    clean_sym = clean_symbol(symbol)
+    
+    print(f"Extracted: symbol={clean_sym}, interval={interval} from URL")
+    
+    # ── STEP 2: Call chart-img.com API ──
+    params = {
+        "symbol": clean_sym,
+        "interval": interval,
+        "width": 800,
+        "height": 500,
+        "theme": "dark",
+        "style": "1",  # 1 = candlestick
+    }
+    
+    headers = {"Authorization": f"Bearer {api_key}"}
+    api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
+    
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)",
-            "Accept":     "image/png,image/jpeg,image/*"
-        }
-        r = requests.get(chart_url.strip(), headers=headers, timeout=15)
-        r.raise_for_status()
-        content_type = r.headers.get("content-type", "")
-        if "image" not in content_type and "octet-stream" not in content_type:
-            print(f"Chart URL returned non-image content: {content_type}")
+        # Get chart URL from API
+        resp = requests.get(api_url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if data.get("url"):
+            # Download the image from the returned URL
+            img_resp = requests.get(data["url"], timeout=10)
+            img_resp.raise_for_status()
+            
+            # Convert to base64
+            b64 = base64.b64encode(img_resp.content).decode("utf-8")
+            print(f"Chart fetched: {clean_sym} | {len(img_resp.content)} bytes")
+            return b64
+        else:
+            print(f"Chart API error: no URL in response")
             return None
-        b64 = base64.b64encode(r.content).decode("utf-8")
-        print(f"Chart image fetched: {len(r.content)} bytes from {chart_url[:60]}")
-        return b64
+            
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401 or e.response.status_code == 403:
+            print("Chart API authentication failed - check CHART_IMG_API_KEY")
+        else:
+            print(f"Chart API HTTP error: {e}")
+        return None
     except Exception as e:
         print(f"Chart fetch error: {e}")
         return None
-
 
 def get_image_mime(chart_url):
     """Detect mime type from URL extension."""
