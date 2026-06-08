@@ -1,6 +1,6 @@
 """
 MIKA TRADING BOT — FINAL VERSION
-=================================
+================================
 Architecture:
   Gate 1   → Session & frequency check
   Gate 2   → Parallel data fetch (Finnhub + GDELT + Calendar)
