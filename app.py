@@ -357,9 +357,8 @@ def detect_market_regime(adx, bb_width=None):
 # ==========================================
 def fetch_chart_image(chart_url):
     """
-    Extract symbol and interval from TradingView URL,
-    then fetch chart image from chart-img.com API.
-    FIXED: chart-img.com returns binary PNG directly, not JSON.
+    Extract symbol and interval from URL, fetch chart image from chart-img.com API.
+    FIXED: Maps symbols to correct TradingView ticker format.
     Returns base64 string or None if failed.
     """
     if not CHART_IMG_API_KEY:
@@ -367,13 +366,14 @@ def fetch_chart_image(chart_url):
         return None
     
     if not chart_url or not isinstance(chart_url, str):
+        print("No chart URL provided")
         return None
     
     # Extract symbol and interval
     symbol = None
     interval = "60"
     
-    symbol_match = re.search(r'symbol=([^&]+)', chart_url)
+    symbol_match = re.search(r'symbol=([^&\s]+)', chart_url)
     if symbol_match:
         symbol = symbol_match.group(1)
     
@@ -382,15 +382,35 @@ def fetch_chart_image(chart_url):
         interval = interval_match.group(1)
     
     if not symbol:
-        print(f"Could not extract symbol from URL: {chart_url[:100]}")
+        print(f"Could not extract symbol from URL: {chart_url[:150]}")
         return None
     
     clean_sym = clean_symbol(symbol)
-    print(f"Extracted: symbol={clean_sym}, interval={interval}")
     
-    # FIXED: chart-img.com /v1/tradingview/advanced-chart returns binary PNG
+    # FIXED: Map to correct TradingView ticker format for chart-img.com
+    # TVC CFD for Gold, Bitstamp for Crypto, OANDA for Forex
+    SYMBOL_TO_TV_TICKER = {
+        "GOLD": "TVC:GOLD",
+        "XAUUSD": "TVC:GOLD",
+        "BTCUSD": "BITSTAMP:BTCUSD",
+        "ETHUSD": "BITSTAMP:ETHUSD",
+    }
+    
+    if clean_sym in SYMBOL_TO_TV_TICKER:
+        tv_symbol = SYMBOL_TO_TV_TICKER[clean_sym]
+    elif len(clean_sym) == 6 and clean_sym not in SYMBOL_TO_TV_TICKER:
+        # Forex pairs use OANDA
+        tv_symbol = f"OANDA:{clean_sym}"
+    else:
+        tv_symbol = clean_sym
+    
+    print(f"Fetching chart: {clean_sym} -> {tv_symbol}, interval={interval}")
+    
+    headers = {"Authorization": f"Bearer {CHART_IMG_API_KEY}"}
+    api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
+    
     params = {
-        "symbol": clean_sym,
+        "symbol": tv_symbol,
         "interval": interval,
         "width": 800,
         "height": 500,
@@ -398,38 +418,41 @@ def fetch_chart_image(chart_url):
         "style": "1",
     }
     
-    headers = {"Authorization": f"Bearer {CHART_IMG_API_KEY}"}
-    api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
-    
     try:
-        resp = requests.get(api_url, headers=headers, params=params, timeout=15)
+        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
+        print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
         resp.raise_for_status()
         
-        content_type = resp.headers.get("Content-Type", "")
+        content_type = resp.headers.get("Content-Type", "").lower()
         
-        # Check if response is JSON (newer API) or binary image (older/standard API)
+        # JSON response (newer API)
         if "application/json" in content_type:
-            # Newer API might return JSON with URL
             data = resp.json()
             if data.get("url"):
-                img_resp = requests.get(data["url"], timeout=10)
+                img_resp = requests.get(data["url"], timeout=15)
                 img_resp.raise_for_status()
                 b64 = base64.b64encode(img_resp.content).decode("utf-8")
-                print(f"Chart fetched via URL: {clean_sym} | {len(img_resp.content)} bytes")
+                print(f"Chart fetched via URL: {tv_symbol} | {len(img_resp.content)} bytes")
                 return b64
             else:
-                print(f"Chart API JSON error: no URL in response")
+                print(f"Chart API JSON has no 'url': {json.dumps(data)[:300]}")
                 return None
+        
+        # Binary image response
+        elif len(resp.content) > 500:
+            b64 = base64.b64encode(resp.content).decode("utf-8")
+            print(f"Chart fetched: {tv_symbol} | {len(resp.content)} bytes")
+            return b64
+        
         else:
-            # Binary image response (standard API behavior)
-            if len(resp.content) > 100:  # Sanity check - valid image should be >100 bytes
-                b64 = base64.b64encode(resp.content).decode("utf-8")
-                print(f"Chart fetched directly: {clean_sym} | {len(resp.content)} bytes")
-                return b64
-            else:
-                print(f"Chart API returned too small response: {len(resp.content)} bytes")
-                return None
+            print(f"Chart API small response: {len(resp.content)} bytes")
+            print(f"Response: {resp.text[:300]}")
+            return None
             
+    except requests.exceptions.HTTPError as e:
+        print(f"Chart API HTTP error: {e}")
+        print(f"Response: {resp.text[:300]}")
+        return None
     except Exception as e:
         print(f"Chart fetch error: {e}")
         return None
@@ -442,8 +465,6 @@ def get_image_mime(chart_url):
     if ".webp" in url_lower:
         return "image/webp"
     return "image/png"
-
-
 # ==========================================
 # MCS ENGINE (FIXED)
 # ==========================================
