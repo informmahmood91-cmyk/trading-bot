@@ -531,13 +531,41 @@ def should_auto_neutral(symbol, session, data, twelve, calendar):
     with cache_lock:
         cached = neutral_cache.get(key)
     
-    # -- CHECK FOR 3+ HIGH-IMPACT EVENTS --
+        # ── CHECK FOR 3+ HIGH-IMPACT EVENTS ──
+    # FIXED: Filter events by relevant currencies only
+    sc_sym = clean_symbol(symbol)
+    
+    COMMODITY_CURRENCY_MAP = {
+        "XAUUSD": ["USD"], "GOLD": ["USD"], "XAGUSD": ["USD"], "SILVER": ["USD"],
+        "USOIL": ["USD"], "UKOIL": ["USD", "GBP"], "WTI": ["USD"], "BRENT": ["USD", "GBP"],
+        "BTCUSD": ["USD"], "ETHUSD": ["USD"],
+        "US30": ["USD"], "NAS100": ["USD"], "SPX500": ["USD"],
+        "GER40": ["EUR"], "UK100": ["GBP"], "JP225": ["JPY"],
+    }
+    
+    if sc_sym in COMMODITY_CURRENCY_MAP:
+        relevant_currencies = COMMODITY_CURRENCY_MAP[sc_sym]
+    elif len(sc_sym) == 6:
+        relevant_currencies = [sc_sym[:3], sc_sym[3:]]
+    else:
+        relevant_currencies = [sc_sym]
+    
     calendar_events = calendar.get("events", [])
-    event_count = len(calendar_events)
+    filtered_events = []
+    for e in calendar_events:
+        if isinstance(e, dict):
+            event_currency = e.get("currency", "")
+            if event_currency in relevant_currencies:
+                filtered_events.append(e.get("event", ""))
+        elif isinstance(e, str):
+            if any(curr in e.upper() for curr in relevant_currencies):
+                filtered_events.append(e)
+    
+    event_count = len(filtered_events)
     
     if event_count >= 3:
-        events_str = ", ".join(calendar_events[:3])
-        return True, f"🚫 3+ HIGH-IMPACT EVENTS: {events_str} - AUTO-NEUTRAL", 0.0
+        events_str = ", ".join(filtered_events[:3])
+        return True, f"🚫 3+ HIGH-IMPACT EVENTS: {events_str} — AUTO-NEUTRAL", 0.0
     
     # V1 - No cache
     if cached is None:
@@ -1023,14 +1051,32 @@ def build_market_context(signal, news, macro, twelve, calendar):
     sym = s.get("symbol","N/A")
 
     # Currency-specific calendar events
-    currencies     = [clean_symbol(sym)[:3], clean_symbol(sym)[3:]] if len(clean_symbol(sym)) == 6 else [sym]
+        # Currency-specific calendar events (FIXED)
+    sc_sym = clean_symbol(sym)
+    
+    COMMODITY_CURRENCY_MAP = {
+        "XAUUSD": ["USD"], "GOLD": ["USD"], "XAGUSD": ["USD"], "SILVER": ["USD"],
+        "USOIL": ["USD"], "UKOIL": ["USD", "GBP"], "WTI": ["USD"], "BRENT": ["USD", "GBP"],
+        "BTCUSD": ["USD"], "ETHUSD": ["USD"],
+        "US30": ["USD"], "NAS100": ["USD"], "SPX500": ["USD"],
+        "GER40": ["EUR"], "UK100": ["GBP"], "JP225": ["JPY"],
+    }
+    
+    if sc_sym in COMMODITY_CURRENCY_MAP:
+        currencies = COMMODITY_CURRENCY_MAP[sc_sym]
+    elif len(sc_sym) == 6:
+        currencies = [sc_sym[:3], sc_sym[3:]]
+    else:
+        currencies = [sc_sym]
+    
     events_raw     = calendar.get("events", [])
     relevant_ev    = []
     for e in events_raw:
         if isinstance(e, dict) and e.get("currency","") in currencies:
             relevant_ev.append(e.get("event",""))
         elif isinstance(e, str):
-            relevant_ev.append(e)
+            if any(curr in e.upper() for curr in currencies):
+                relevant_ev.append(e)
     cal_note = (f"⚠️ RELEVANT HIGH IMPACT: {', '.join(relevant_ev)}"
                 if relevant_ev else "No relevant high-impact events.")
 
