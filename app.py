@@ -1956,19 +1956,55 @@ def process_signal_background(data):
             f"⏳ Fetching live data..."
         )
 
-        # GATE 2 - PARALLEL DATA FETCH
+                # GATE 2 — PARALLEL DATA FETCH
         news, macro, calendar = fetch_all_live_data(symbol)
 
-        # GATE 2.5 - CURRENCY-SPECIFIC CALENDAR HARD BLOCK (3+ events)
-        sc          = clean_symbol(symbol)
-        currencies  = [sc[:3], sc[3:]] if len(sc) == 6 else [sc]
-        events_raw  = calendar.get("events", [])
-        rel_events  = []
+        # GATE 2.5 — CURRENCY-SPECIFIC CALENDAR HARD BLOCK (3+ events)
+        sc = clean_symbol(symbol)
+        
+        # FIXED: Proper currency mapping for commodities, indices, and crypto
+        COMMODITY_CURRENCY_MAP = {
+            "XAUUSD": ["USD"],
+            "GOLD": ["USD"],
+            "XAGUSD": ["USD"],
+            "SILVER": ["USD"],
+            "USOIL": ["USD"],
+            "UKOIL": ["USD", "GBP"],
+            "WTI": ["USD"],
+            "BRENT": ["USD", "GBP"],
+            "BTCUSD": ["USD"],
+            "ETHUSD": ["USD"],
+            "US30": ["USD"],
+            "NAS100": ["USD"],
+            "SPX500": ["USD"],
+            "GER40": ["EUR"],
+            "UK100": ["GBP"],
+            "JP225": ["JPY"],
+        }
+        
+        if sc in COMMODITY_CURRENCY_MAP:
+            currencies = COMMODITY_CURRENCY_MAP[sc]
+        elif len(sc) == 6:
+            currencies = [sc[:3], sc[3:]]
+        elif len(sc) == 7 and "/" in sc:
+            # Format like "XAU/USD" or "BTC/USD"
+            parts = sc.split("/")
+            currencies = [parts[0], parts[1]]
+        else:
+            # Unknown format — use symbol itself as fallback
+            currencies = [sc]
+        
+        events_raw = calendar.get("events", [])
+        rel_events = []
         for e in events_raw:
-            if isinstance(e, dict) and e.get("currency","") in currencies:
-                rel_events.append(e.get("event",""))
+            if isinstance(e, dict):
+                event_currency = e.get("currency", "")
+                if event_currency in currencies:
+                    rel_events.append(e.get("event", ""))
             elif isinstance(e, str):
-                rel_events.append(e)
+                # String events — check if any currency code appears in the event name
+                if any(curr in e.upper() for curr in currencies):
+                    rel_events.append(e)
 
         if len(rel_events) >= 3:
             send_telegram(
