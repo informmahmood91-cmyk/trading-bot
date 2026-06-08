@@ -1482,7 +1482,18 @@ def chatgpt_decides(symbol, price, signal, gemini_out, chatgpt_out,
     context  = build_market_context(signal, {}, {}, twelve, calendar)
     atr_td   = safe_float(twelve.get("atr"))
     atr_ps   = safe_float(signal.get("atr"))
-    atr_use  = atr_td or atr_ps
+    # FIXED: Same ATR override logic
+    if atr_td is not None and atr_ps is not None and atr_ps > 0:
+        if atr_td < atr_ps * 0.2:
+            atr_use = atr_ps
+        else:
+            atr_use = atr_td
+    elif atr_ps is not None:
+        atr_use = atr_ps
+    elif atr_td is not None:
+        atr_use = atr_td
+    else:
+        atr_use = None
     profile  = RISK_PROFILES.get(AI_RISK_PROFILE, RISK_PROFILES["BALANCED"])
 
     prompt_text = f"""You are a senior execution trader reviewing two independent analyses of {symbol} H1.
@@ -1890,7 +1901,21 @@ def _send_trade(symbol, price, signal, twelve_data,
 
     atr_td  = safe_float(twelve_data.get("atr"))
     atr_ps  = safe_float(signal.get("atr"))
-    atr_use = atr_td or atr_ps
+    # FIXED: Prefer webhook ATR when Twelve Data ATR is suspiciously small.
+    # Twelve Data sometimes returns tiny ATR for commodities (e.g. 0.5 for Gold
+    # when real ATR is 5+). If Twelve Data ATR < 20% of webhook ATR, use webhook.
+    if atr_td is not None and atr_ps is not None and atr_ps > 0:
+        if atr_td < atr_ps * 0.2:
+            atr_use = atr_ps
+            print(f"ATR override: Twelve Data={atr_td} too small vs webhook={atr_ps}, using webhook")
+        else:
+            atr_use = atr_td
+    elif atr_ps is not None:
+        atr_use = atr_ps
+    elif atr_td is not None:
+        atr_use = atr_td
+    else:
+        atr_use = None
     sl, tp, rr = calculate_sl_tp(final_dir, price, atr_use)
 
     valid, v_msg = validate_levels(final_dir, price, sl, tp)
@@ -1927,8 +1952,7 @@ def _send_trade(symbol, price, signal, twelve_data,
     register_trade(symbol, session)
     update_neutral_cache(symbol, session, final_dir, signal, twelve_data)
     return True
-
-
+                    
 # ==========================================
 # MAIN WEBHOOK WITH BACKGROUND PROCESSING
 # ==========================================
