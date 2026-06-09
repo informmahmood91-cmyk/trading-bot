@@ -468,6 +468,16 @@ def fetch_chart_image(chart_url):
     
     print("Chart API: failed after 3 retries (rate limited)")
     return None
+
+
+def get_image_mime(chart_url):
+    """Detect mime type from URL extension."""
+    url_lower = (chart_url or "").lower()
+    if ".jpg" in url_lower or ".jpeg" in url_lower:
+        return "image/jpeg"
+    if ".webp" in url_lower:
+        return "image/webp"
+    return "image/png"
 # ==========================================
 # MCS ENGINE (FIXED)
 # ==========================================
