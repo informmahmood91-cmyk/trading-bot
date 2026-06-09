@@ -884,10 +884,24 @@ def register_trade(symbol, session):
 # ==========================================
 # FINNHUB
 # ==========================================
+_finnhub_cache = {}
+_finnhub_cache_lock = threading.Lock()
+FINNHUB_CACHE_TTL = 1800  # 30 minutes
+
 def fetch_finnhub(symbol):
     if not FINNHUB_KEY:
         return {"sentiment": "NEUTRAL", "headlines": [], "symbol_matched": False}
+    
     symbol = clean_symbol(symbol)
+    now    = time.time()
+
+    with _finnhub_cache_lock:
+        cached = _finnhub_cache.get(symbol)
+    if cached is not None and (now - cached["ts"]) < FINNHUB_CACHE_TTL:
+        age = int(now - cached["ts"])
+        print(f"Finnhub cache hit for {symbol} ({age}s old)")
+        return cached["result"]
+
     kw_map = {
         "EURUSD":["EUR","Euro","ECB"],"GBPUSD":["GBP","Pound","BOE"],
         "USDJPY":["JPY","Yen","BOJ"],"USDCHF":["CHF","Franc","SNB"],
@@ -898,6 +912,7 @@ def fetch_finnhub(symbol):
         "USOIL":["Oil","WTI","crude","OPEC"],"UKOIL":["Oil","Brent","OPEC"],
         "BTCUSD":["Bitcoin","BTC"],"ETHUSD":["Ethereum","ETH"],
         "US30":["Dow Jones","DJIA"],"NAS100":["Nasdaq"],"SPX500":["S&P 500"],
+        "GOLD":["Gold","XAU","bullion","Fed"],
     }
     kws = kw_map.get(symbol, [symbol[:3], symbol[3:]] if len(symbol)==6 else [symbol])
     try:
@@ -914,60 +929,119 @@ def fetch_finnhub(symbol):
         bull      = sum(w in text for w in ["rise","bull","gain","growth","hawkish","strong"])
         bear      = sum(w in text for w in ["fall","bear","drop","recession","dovish","weak"])
         sentiment = "POSITIVE" if bull > bear else "NEGATIVE" if bear > bull else "NEUTRAL"
-        return {"sentiment": sentiment, "headlines": matched[:5], "symbol_matched": bool(matched)}
+        result    = {"sentiment": sentiment, "headlines": matched[:5], "symbol_matched": bool(matched)}
+        with _finnhub_cache_lock:
+            _finnhub_cache[symbol] = {"result": result, "ts": now}
+            if len(_finnhub_cache) > 50:
+                oldest = min(_finnhub_cache, key=lambda k: _finnhub_cache[k]["ts"])
+                del _finnhub_cache[oldest]
+        return result
     except Exception as e:
         print(f"Finnhub error: {e}")
+        with _finnhub_cache_lock:
+            cached = _finnhub_cache.get(symbol)
+        if cached is not None:
+            print(f"Finnhub using stale cache for {symbol} after error")
+            return cached["result"]
         return {"sentiment": "NEUTRAL", "headlines": [], "symbol_matched": False}
 
 
 # ==========================================
-# ECONOMIC CALENDAR
+# ECONOMIC CALENDAR (WITH THREAD-SAFE CACHE)
 # ==========================================
+_calendar_cache = {"result": None, "ts": 0}
+_calendar_cache_lock = threading.Lock()
+CALENDAR_CACHE_TTL = 3600  # 60 minutes
+
 def fetch_economic_calendar():
     if not FINNHUB_KEY:
         return {"high_impact_soon": False, "events": []}
+
+    now = time.time()
+    with _calendar_cache_lock:
+        cache_age = now - _calendar_cache["ts"]
+        cached_result = _calendar_cache["result"]
+
+    if cached_result is not None and cache_age < CALENDAR_CACHE_TTL:
+        print(f"Calendar cache hit ({int(cache_age/60)}m old)")
+        return cached_result
+
+    print("Calendar cache expired - fetching fresh")
     try:
-        now = datetime.now(timezone.utc)
+        now_dt = datetime.now(timezone.utc)
         url = (f"https://finnhub.io/api/v1/calendar/economic"
-               f"?from={now.strftime('%Y-%m-%d')}"
-               f"&to={(now+timedelta(days=1)).strftime('%Y-%m-%d')}"
+               f"?from={now_dt.strftime('%Y-%m-%d')}"
+               f"&to={(now_dt+timedelta(days=1)).strftime('%Y-%m-%d')}"
                f"&token={FINNHUB_KEY}")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         events = r.json().get("economicCalendar", [])
         high   = [e for e in events if e.get("impact") == "high"]
-        return {"high_impact_soon": bool(high), "events": [e.get("event","") for e in high[:5]]}
+        result = {"high_impact_soon": bool(high), "events": [e.get("event","") for e in high[:5]]}
+        with _calendar_cache_lock:
+            _calendar_cache["result"] = result
+            _calendar_cache["ts"]     = now
+        return result
     except Exception as e:
         print(f"Calendar error: {e}")
+        with _calendar_cache_lock:
+            cached_result = _calendar_cache["result"]
+        if cached_result is not None:
+            print("Calendar using stale cache after error")
+            return cached_result
         return {"high_impact_soon": False, "events": []}
 
+# ==========================================
+# GDELT (WITH THREAD-SAFE CACHE)
+# ==========================================
+_gdelt_cache = {"result": None, "ts": 0}
+_gdelt_cache_lock = threading.Lock()
+GDELT_CACHE_TTL = 28800  # 8 hours
 
-# ==========================================
-# GDELT
-# ==========================================
 def fetch_gdelt():
+    now = time.time()
+    with _gdelt_cache_lock:
+        cache_age = now - _gdelt_cache["ts"]
+        cached_result = _gdelt_cache["result"]
+
+    if cached_result is not None and cache_age < GDELT_CACHE_TTL:
+        print(f"GDELT cache hit ({int(cache_age/3600)}h {int((cache_age%3600)/60)}m old)")
+        return cached_result
+
+    print("GDELT cache expired - fetching fresh")
     try:
         r = requests.get(
             "https://api.gdeltproject.org/api/v2/doc/doc?query=global%20economy&mode=ArtList&format=json",
             timeout=10)
         r.raise_for_status()
-        articles = r.json().get("articles",[])[:5]
+        articles = r.json().get("articles", [])[:5]
         score    = sum(1 for a in articles
-                       if any(w in a.get("title","").lower()
+                       if any(w in a.get("title", "").lower()
                               for w in ["war","inflation","crisis","recession","sanctions"]))
-        risk = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
-        return {"risk": risk, "score": score}
+        risk   = "HIGH" if score >= 3 else "MEDIUM" if score >= 1 else "LOW"
+        result = {"risk": risk, "score": score}
+        with _gdelt_cache_lock:
+            _gdelt_cache["result"] = result
+            _gdelt_cache["ts"]     = now
+        return result
     except Exception as e:
         print(f"GDELT error: {e}")
+        with _gdelt_cache_lock:
+            cached_result = _gdelt_cache["result"]
+        if cached_result is not None:
+            print("GDELT using stale cache after error")
+            return cached_result
         return {"risk": "LOW", "score": 0}
 
+# ==========================================
+# FETCH ALL LIVE DATA
+# ==========================================
 def fetch_all_live_data(symbol):
     with ThreadPoolExecutor(max_workers=3) as ex:
         fn = ex.submit(fetch_finnhub, symbol)
         fm = ex.submit(fetch_gdelt)
         fc = ex.submit(fetch_economic_calendar)
         return fn.result(), fm.result(), fc.result()
-
 
 # ==========================================
 # TWELVE DATA - 7 CORE INDICATORS (FIXED)
