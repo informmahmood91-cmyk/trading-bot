@@ -2444,28 +2444,31 @@ if __name__ == "__main__":
     print(f"Triple Exhaust: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['triple_exhaust_enabled'] else 'OFF'}")
     print(f"Pivot Block: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['pivot_block_enabled'] else 'OFF'}")
     print(f"Session times: London 12:00-17:59 PKT | NewYork 18:00-01:59 PKT | Off 02:00-11:59 PKT")
-    
-    # FIXED: Use pytz timezone properly
+   
     PKT = pytz.timezone("Asia/Karachi")
-    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler = BackgroundScheduler(timezone=PKT)
 
-    # 09:00 PKT overnight snapshot
     scheduler.add_job(send_presession_snapshot, "cron",
                       hour=9, minute=0, args=["overnight"],
-                      id="overnight", timezone=PKT)
+                      id="overnight")
 
-    # 11:59 PKT pre-session snapshot
     scheduler.add_job(send_presession_snapshot, "cron",
                       hour=11, minute=59, args=["presession"],
-                      id="presession", timezone=PKT)
+                      id="presession")
 
-    # 00:00 PKT midnight reset
     scheduler.add_job(reset_day, "cron",
                       hour=0, minute=0,
-                      id="midnight_reset", timezone=PKT)
-    
+                      id="midnight_reset")
+   
     scheduler.start()
-    print("Scheduler started: Midnight reset + 09:00 & 11:59 PKT daily")
     
+    # DEBUG: Verify jobs are scheduled
+    from datetime import datetime
+    for job in scheduler.get_jobs():
+        print(f"SCHEDULED JOB: {job.id} | Next run: {job.next_run_time}")
+    print(f"Current PKT time: {datetime.now(PKT)}")
+    print(f"Current UTC time: {datetime.now(pytz.UTC)}")
+    print("Scheduler started on Asia/Karachi timezone.")
+   
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
