@@ -359,6 +359,7 @@ def fetch_chart_image(chart_url):
     """
     Extract symbol and interval from URL, fetch chart image from chart-img.com API.
     FIXED: Converts numerical interval mappings and style references natively to 1h/candles.
+    FIXED: Strips exchange prefix before symbol lookup to prevent 422 errors.
     """
     if not CHART_IMG_API_KEY:
         print("No CHART_IMG_API_KEY - chart vision disabled")
@@ -384,12 +385,14 @@ def fetch_chart_image(chart_url):
         return None
    
     clean_sym = clean_symbol(symbol)
+    if ":" in clean_sym:
+        clean_sym = clean_sym.split(":", 1)[1].upper()
    
     SYMBOL_TO_TV_TICKER = {
         "GOLD": "TVC:GOLD",
         "XAUUSD": "TVC:GOLD",
-        "BTCUSD": "BITSTAMP:BTCUSD",
-        "ETHUSD": "BITSTAMP:ETHUSD",
+        "BTCUSD": "BINANCE:BTCUSDT",
+        "ETHUSD": "BINANCE:ETHUSDT",
     }
    
     if clean_sym in SYMBOL_TO_TV_TICKER:
@@ -399,7 +402,6 @@ def fetch_chart_image(chart_url):
     else:
         tv_symbol = clean_sym
        
-    # FORCE CORRECT API VALUES BEFORE COMPILING PARAMS
     api_interval = "1h"
     
     print(f"Fetching chart: {clean_sym} -> {tv_symbol}, explicitly forced interval={api_interval}")
@@ -436,8 +438,7 @@ def fetch_chart_image(chart_url):
     except Exception as e:
         print(f"Chart fetch error detailed bypass: {e}")
         return None
-
-
+        
 def get_image_mime(chart_url):
     """Safely maps out structural binary mime formats."""
     url_lower = (chart_url or "").lower()
@@ -1464,7 +1465,6 @@ def chatgpt_decides(symbol, price, signal, gemini_out, chatgpt_out,
     atr_td   = safe_float(twelve.get("atr"))
     atr_ps   = safe_float(signal.get("atr"))
    
-    # FIXED: Same ATR override logic
     if atr_td is not None and atr_ps is not None and atr_ps > 0:
         if atr_td < atr_ps * 0.2:
             atr_use = atr_ps
@@ -1539,11 +1539,13 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
             "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
         })
 
-    tools = [{"type": "web_search"}] if ENABLE_WEB_SEARCH else []
+    ARBITER_MODEL = "gpt-4o-mini"
+    WEB_SEARCH_CAPABLE = {"gpt-4o", "gpt-4o-2024-05-13", "gpt-4o-2024-11-20", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"}
+    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH and ARBITER_MODEL in WEB_SEARCH_CAPABLE else []
 
     def _make_request(use_tools=True):
         payload = {
-            "model":    "gpt-4o-mini",
+            "model":    ARBITER_MODEL,
             "messages": [{"role": "user", "content": prompt_parts}],
             "temperature": 0.3,
             "max_tokens":  1200
@@ -1585,46 +1587,6 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
             return decision, text
         except Exception as e2:
             return "DEBATE", f"Decision error: {e2}"
-
-
-# ==========================================
-# CHATGPT - CHALLENGE GEMINI (debate round)
-# ==========================================
-def chatgpt_challenge(symbol, chatgpt_view, gemini_view):
-    if not CHATGPT_KEY:
-        return "CHATGPT ERROR: No API key"
-    prompt = f"""You are a market analyst. Your peer Gemini reached a different conclusion on {symbol}.
-
-YOUR VIEW:
-{chatgpt_view}
-
-GEMINI VIEW:
-{gemini_view}
-
-Write a focused 3-4 sentence challenge. Be specific:
-- Name the exact data point or pattern you disagree on
-- State the specific number or chart observation supporting your view
-- What should Gemini reconsider?
-
-No final call - just challenge the specific gap in reasoning."""
-
-    try:
-        r = requests.post(
-            OPENAI_URL,
-            headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
-            json={
-                "model":    "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3, "max_tokens": 400
-            },
-            timeout=45
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"CHATGPT CHALLENGE ERROR: {str(e)}"
-
-
 # ==========================================
 # GEMINI - DEFEND (debate round)
 # ==========================================
