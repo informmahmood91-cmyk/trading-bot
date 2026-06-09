@@ -424,6 +424,8 @@ def fetch_chart_image(chart_url):
     try:
         resp = requests.get(api_url, headers=headers, params=params, timeout=20)
         print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
+        if resp.status_code != 200:
+            print(f"Chart API error body: {resp.text}")
         resp.raise_for_status()
        
         content_type = resp.headers.get("Content-Type", "").lower()
