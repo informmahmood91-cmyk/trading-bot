@@ -360,6 +360,7 @@ def fetch_chart_image(chart_url):
     Extract symbol and interval from URL, fetch chart image from chart-img.com API.
     FIXED: Converts numerical interval mappings and style references natively to 1h/candles.
     FIXED: Strips exchange prefix before symbol lookup to prevent 422 errors.
+    FIXED: Correct symbol mappings per chart-img docs. style=1 (candles numeric code).
     """
     if not CHART_IMG_API_KEY:
         print("No CHART_IMG_API_KEY - chart vision disabled")
@@ -389,10 +390,12 @@ def fetch_chart_image(chart_url):
         clean_sym = clean_sym.split(":", 1)[1].upper()
    
     SYMBOL_TO_TV_TICKER = {
-        "GOLD": "TVC:GOLD",
-        "XAUUSD": "TVC:GOLD",
-        "BTCUSD": "BINANCE:BTCUSDT",
-        "ETHUSD": "BINANCE:ETHUSDT",
+        "GOLD":    "TVC:GOLD",
+        "XAUUSD":  "TVC:GOLD",
+        "BTCUSD":  "BITSTAMP:BTCUSD",
+        "ETHUSD":  "BITSTAMP:ETHUSD",
+        "BTCUSDT": "BINANCE:BTCUSDT",
+        "ETHUSDT": "BINANCE:ETHUSDT",
     }
    
     if clean_sym in SYMBOL_TO_TV_TICKER:
@@ -410,12 +413,12 @@ def fetch_chart_image(chart_url):
     api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
    
     params = {
-        "symbol": tv_symbol,
+        "symbol":   tv_symbol,
         "interval": api_interval,
-        "width": 800,
-        "height": 500,
-        "theme": "dark",
-        "style": "candles",
+        "width":    800,
+        "height":   500,
+        "theme":    "dark",
+        "style":    "1",
     }
    
     try:
@@ -1587,6 +1590,45 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
             return decision, text
         except Exception as e2:
             return "DEBATE", f"Decision error: {e2}"
+
+
+# ==========================================
+# CHATGPT - CHALLENGE GEMINI (debate round)
+# ==========================================
+def chatgpt_challenge(symbol, chatgpt_view, gemini_view):
+    if not CHATGPT_KEY:
+        return "CHATGPT ERROR: No API key"
+    prompt = f"""You are a market analyst. Your peer Gemini reached a different conclusion on {symbol}.
+
+YOUR VIEW:
+{chatgpt_view}
+
+GEMINI VIEW:
+{gemini_view}
+
+Write a focused 3-4 sentence challenge. Be specific:
+- Name the exact data point or pattern you disagree on
+- State the specific number or chart observation supporting your view
+- What should Gemini reconsider?
+
+No final call - just challenge the specific gap in reasoning."""
+
+    try:
+        r = requests.post(
+            OPENAI_URL,
+            headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":    "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3, "max_tokens": 400
+            },
+            timeout=45
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"CHATGPT CHALLENGE ERROR: {str(e)}"
+
 # ==========================================
 # GEMINI - DEFEND (debate round)
 # ==========================================
