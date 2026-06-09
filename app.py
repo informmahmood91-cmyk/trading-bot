@@ -360,35 +360,36 @@ def fetch_chart_image(chart_url):
     Extract symbol and interval from URL, fetch chart image from chart-img.com API.
     FIXED: Converts numerical interval mappings and style references natively to 1h/candles.
     FIXED: Strips exchange prefix before symbol lookup to prevent 422 errors.
-    FIXED: Correct symbol mappings per chart-img docs. style=1 (candles numeric code).
+    FIXED: Correct symbol mappings per chart-img docs.
+    FIXED: POST with JSON body instead of GET with query params. style=candle.
     """
     if not CHART_IMG_API_KEY:
         print("No CHART_IMG_API_KEY - chart vision disabled")
         return None
-   
+
     if not chart_url or not isinstance(chart_url, str):
         print("No chart URL provided")
         return None
-   
+
     symbol = None
     interval = "60"
-   
+
     symbol_match = re.search(r'symbol=([^&\s]+)', chart_url)
     if symbol_match:
         symbol = symbol_match.group(1)
-   
+
     interval_match = re.search(r'interval=(\d+)', chart_url)
     if interval_match:
         interval = interval_match.group(1)
-   
+
     if not symbol:
         print(f"Could not extract symbol from URL: {chart_url[:150]}")
         return None
-   
+
     clean_sym = clean_symbol(symbol)
     if ":" in clean_sym:
         clean_sym = clean_sym.split(":", 1)[1].upper()
-   
+
     SYMBOL_TO_TV_TICKER = {
         "GOLD":    "TVC:GOLD",
         "XAUUSD":  "TVC:GOLD",
@@ -397,37 +398,40 @@ def fetch_chart_image(chart_url):
         "BTCUSDT": "BINANCE:BTCUSDT",
         "ETHUSDT": "BINANCE:ETHUSDT",
     }
-   
+
     if clean_sym in SYMBOL_TO_TV_TICKER:
         tv_symbol = SYMBOL_TO_TV_TICKER[clean_sym]
     elif len(clean_sym) == 6 and clean_sym not in SYMBOL_TO_TV_TICKER:
         tv_symbol = f"OANDA:{clean_sym}"
     else:
         tv_symbol = clean_sym
-       
+
     api_interval = "1h"
-    
+
     print(f"Fetching chart: {clean_sym} -> {tv_symbol}, explicitly forced interval={api_interval}")
-   
-    headers = {"Authorization": f"Bearer {CHART_IMG_API_KEY}"}
+
+    headers = {
+        "Authorization": f"Bearer {CHART_IMG_API_KEY}",
+        "Content-Type":  "application/json"
+    }
     api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
-   
-    params = {
+
+    payload = {
         "symbol":   tv_symbol,
         "interval": api_interval,
         "width":    800,
         "height":   500,
         "theme":    "dark",
-        "style":    "1",
+        "style":    "candle",
     }
-   
+
     try:
-        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=20)
         print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
         if resp.status_code != 200:
             print(f"Chart API error body: {resp.text}")
         resp.raise_for_status()
-       
+
         content_type = resp.headers.get("Content-Type", "").lower()
         if "application/json" in content_type:
             data = resp.json()
@@ -439,7 +443,7 @@ def fetch_chart_image(chart_url):
         elif len(resp.content) > 500:
             return base64.b64encode(resp.content).decode("utf-8")
         return None
-           
+
     except Exception as e:
         print(f"Chart fetch error detailed bypass: {e}")
         return None
