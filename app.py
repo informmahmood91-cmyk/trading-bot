@@ -358,120 +358,88 @@ def detect_market_regime(adx, bb_width=None):
 def fetch_chart_image(chart_url):
     """
     Extract symbol and interval from URL, fetch chart image from chart-img.com API.
-    Returns base64 string or None if failed.
+    FIXED: Converts numerical interval mappings and style references natively to 1h/candles.
     """
     if not CHART_IMG_API_KEY:
         print("No CHART_IMG_API_KEY - chart vision disabled")
         return None
-    
+   
     if not chart_url or not isinstance(chart_url, str):
         print("No chart URL provided")
         return None
-    
-    # Extract symbol and interval
+   
     symbol = None
     interval = "60"
-    
+   
     symbol_match = re.search(r'symbol=([^&\s]+)', chart_url)
     if symbol_match:
         symbol = symbol_match.group(1)
-    
+   
     interval_match = re.search(r'interval=(\d+)', chart_url)
     if interval_match:
         interval = interval_match.group(1)
-    
+   
     if not symbol:
         print(f"Could not extract symbol from URL: {chart_url[:150]}")
         return None
-    
+   
     clean_sym = clean_symbol(symbol)
-    
-    # Map to correct TradingView ticker format
+   
     SYMBOL_TO_TV_TICKER = {
         "GOLD": "TVC:GOLD",
         "XAUUSD": "TVC:GOLD",
         "BTCUSD": "BITSTAMP:BTCUSD",
         "ETHUSD": "BITSTAMP:ETHUSD",
     }
-    
+   
     if clean_sym in SYMBOL_TO_TV_TICKER:
         tv_symbol = SYMBOL_TO_TV_TICKER[clean_sym]
     elif len(clean_sym) == 6 and clean_sym not in SYMBOL_TO_TV_TICKER:
         tv_symbol = f"OANDA:{clean_sym}"
     else:
         tv_symbol = clean_sym
+       
+    # FORCE CORRECT API VALUES BEFORE COMPILING PARAMS
+    api_interval = "1h"
     
-    print(f"Fetching chart: {clean_sym} -> {tv_symbol}, interval={interval}")
-    
+    print(f"Fetching chart: {clean_sym} -> {tv_symbol}, explicitly forced interval={api_interval}")
+   
     headers = {"Authorization": f"Bearer {CHART_IMG_API_KEY}"}
     api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
-    
+   
     params = {
         "symbol": tv_symbol,
-        "interval": interval,
+        "interval": api_interval,
         "width": 800,
         "height": 500,
         "theme": "dark",
-        "style": "1",
+        "style": "candles",
     }
-    
-    # Retry with backoff for rate limits
-    for attempt in range(3):
-        try:
-            resp = requests.get(api_url, headers=headers, params=params, timeout=20)
-            
-            # Rate limited — wait and retry
-            if resp.status_code == 429:
-                wait = (attempt + 1) * 5
-                print(f"Chart API rate limited, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            
-            print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
-            resp.raise_for_status()
-            
-            content_type = resp.headers.get("Content-Type", "").lower()
-            
-            # JSON response
-            if "application/json" in content_type:
-                data = resp.json()
-                if data.get("url"):
-                    img_resp = requests.get(data["url"], timeout=15)
-                    img_resp.raise_for_status()
-                    b64 = base64.b64encode(img_resp.content).decode("utf-8")
-                    print(f"Chart fetched via URL: {tv_symbol} | {len(img_resp.content)} bytes")
-                    return b64
-                else:
-                    print(f"Chart API JSON has no 'url': {json.dumps(data)[:300]}")
-                    return None
-            
-            # Binary image response
-            elif len(resp.content) > 500:
-                b64 = base64.b64encode(resp.content).decode("utf-8")
-                print(f"Chart fetched: {tv_symbol} | {len(resp.content)} bytes")
-                return b64
-            
-            else:
-                print(f"Chart API small response: {len(resp.content)} bytes")
-                print(f"Response: {resp.text[:300]}")
-                return None
-               
-        except requests.exceptions.HTTPError as e:
-            if resp.status_code == 429:
-                continue
-            print(f"Chart API HTTP error: {e}")
-            print(f"Response: {resp.text[:300]}")
+   
+    try:
+        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
+        print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
+        resp.raise_for_status()
+       
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "application/json" in content_type:
+            data = resp.json()
+            if data.get("url"):
+                img_resp = requests.get(data["url"], timeout=15)
+                img_resp.raise_for_status()
+                return base64.b64encode(img_resp.content).decode("utf-8")
             return None
-        except Exception as e:
-            print(f"Chart fetch error: {e}")
-            return None
-    
-    print("Chart API: failed after 3 retries (rate limited)")
-    return None
+        elif len(resp.content) > 500:
+            return base64.b64encode(resp.content).decode("utf-8")
+        return None
+           
+    except Exception as e:
+        print(f"Chart fetch error detailed bypass: {e}")
+        return None
 
 
 def get_image_mime(chart_url):
-    """Detect mime type from URL extension."""
+    """Safely maps out structural binary mime formats."""
     url_lower = (chart_url or "").lower()
     if ".jpg" in url_lower or ".jpeg" in url_lower:
         return "image/jpeg"
@@ -1495,6 +1463,7 @@ def chatgpt_decides(symbol, price, signal, gemini_out, chatgpt_out,
     context  = build_market_context(signal, {}, {}, twelve, calendar)
     atr_td   = safe_float(twelve.get("atr"))
     atr_ps   = safe_float(signal.get("atr"))
+   
     # FIXED: Same ATR override logic
     if atr_td is not None and atr_ps is not None and atr_ps > 0:
         if atr_td < atr_ps * 0.2:
@@ -1570,10 +1539,9 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
             "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
         })
 
-    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH else []
+    tools = [{"type": "web_search"}] if ENABLE_WEB_SEARCH else []
 
     def _make_request(use_tools=True):
-        """FIXED: Extracted request logic to ensure tools are included on retry."""
         payload = {
             "model":    "gpt-4o-mini",
             "messages": [{"role": "user", "content": prompt_parts}],
@@ -1582,7 +1550,7 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
         }
         if use_tools and tools:
             payload["tools"] = tools
-        
+       
         r = requests.post(
             OPENAI_URL,
             headers={"Authorization": f"Bearer {CHATGPT_KEY}", "Content-Type": "application/json"},
@@ -1592,14 +1560,14 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
         r.raise_for_status()
         resp = r.json()
         content = resp["choices"][0]["message"]
-        
+       
         if isinstance(content.get("content"), list):
             return " ".join(b.get("text","") for b in content["content"] if b.get("type")=="text")
         return content.get("content","") or ""
 
     try:
         text = _make_request(use_tools=True)
-        
+       
         if not text.strip():
             return "DEBATE", "Could not parse decision response"
 
@@ -1609,9 +1577,8 @@ WHY THIS DECISION: [2-3 sentences - final reasoning]
 
     except Exception as e:
         print(f"chatgpt_decides error: {e}")
-        time.sleep(3) 
+        time.sleep(3)
         try:
-            # FIXED: Retry includes tools parameter
             text = _make_request(use_tools=True)
             dm = re.search(r'DECISION\s*[:\-]\s*(AGREE_BUY|AGREE_SELL|AGREE_NEUTRAL|DEBATE)', text.upper())
             decision = dm.group(1) if dm else "DEBATE"
