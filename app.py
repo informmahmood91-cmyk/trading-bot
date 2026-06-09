@@ -414,7 +414,7 @@ def fetch_chart_image(chart_url):
         "Authorization": f"Bearer {CHART_IMG_API_KEY}",
         "Content-Type":  "application/json"
     }
-    api_url = "https://api.chart-img.com/v1/tradingview/advanced-chart"
+    api_url = "https://api.chart-img.com/v2/tradingview/advanced-chart"
 
     payload = {
         "symbol":   tv_symbol,
