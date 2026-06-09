@@ -358,7 +358,6 @@ def detect_market_regime(adx, bb_width=None):
 def fetch_chart_image(chart_url):
     """
     Extract symbol and interval from URL, fetch chart image from chart-img.com API.
-    FIXED: Maps symbols to correct TradingView ticker format.
     Returns base64 string or None if failed.
     """
     if not CHART_IMG_API_KEY:
@@ -387,8 +386,7 @@ def fetch_chart_image(chart_url):
     
     clean_sym = clean_symbol(symbol)
     
-    # FIXED: Map to correct TradingView ticker format for chart-img.com
-    # TVC CFD for Gold, Bitstamp for Crypto, OANDA for Forex
+    # Map to correct TradingView ticker format
     SYMBOL_TO_TV_TICKER = {
         "GOLD": "TVC:GOLD",
         "XAUUSD": "TVC:GOLD",
@@ -399,7 +397,6 @@ def fetch_chart_image(chart_url):
     if clean_sym in SYMBOL_TO_TV_TICKER:
         tv_symbol = SYMBOL_TO_TV_TICKER[clean_sym]
     elif len(clean_sym) == 6 and clean_sym not in SYMBOL_TO_TV_TICKER:
-        # Forex pairs use OANDA
         tv_symbol = f"OANDA:{clean_sym}"
     else:
         tv_symbol = clean_sym
@@ -418,53 +415,59 @@ def fetch_chart_image(chart_url):
         "style": "1",
     }
     
-    try:
-        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
-        print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
-        resp.raise_for_status()
-        
-        content_type = resp.headers.get("Content-Type", "").lower()
-        
-        # JSON response (newer API)
-        if "application/json" in content_type:
-            data = resp.json()
-            if data.get("url"):
-                img_resp = requests.get(data["url"], timeout=15)
-                img_resp.raise_for_status()
-                b64 = base64.b64encode(img_resp.content).decode("utf-8")
-                print(f"Chart fetched via URL: {tv_symbol} | {len(img_resp.content)} bytes")
+    # Retry with backoff for rate limits
+    for attempt in range(3):
+        try:
+            resp = requests.get(api_url, headers=headers, params=params, timeout=20)
+            
+            # Rate limited — wait and retry
+            if resp.status_code == 429:
+                wait = (attempt + 1) * 5
+                print(f"Chart API rate limited, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            
+            print(f"Chart API: status={resp.status_code}, type={resp.headers.get('Content-Type','')}, size={len(resp.content)}")
+            resp.raise_for_status()
+            
+            content_type = resp.headers.get("Content-Type", "").lower()
+            
+            # JSON response
+            if "application/json" in content_type:
+                data = resp.json()
+                if data.get("url"):
+                    img_resp = requests.get(data["url"], timeout=15)
+                    img_resp.raise_for_status()
+                    b64 = base64.b64encode(img_resp.content).decode("utf-8")
+                    print(f"Chart fetched via URL: {tv_symbol} | {len(img_resp.content)} bytes")
+                    return b64
+                else:
+                    print(f"Chart API JSON has no 'url': {json.dumps(data)[:300]}")
+                    return None
+            
+            # Binary image response
+            elif len(resp.content) > 500:
+                b64 = base64.b64encode(resp.content).decode("utf-8")
+                print(f"Chart fetched: {tv_symbol} | {len(resp.content)} bytes")
                 return b64
+            
             else:
-                print(f"Chart API JSON has no 'url': {json.dumps(data)[:300]}")
+                print(f"Chart API small response: {len(resp.content)} bytes")
+                print(f"Response: {resp.text[:300]}")
                 return None
-        
-        # Binary image response
-        elif len(resp.content) > 500:
-            b64 = base64.b64encode(resp.content).decode("utf-8")
-            print(f"Chart fetched: {tv_symbol} | {len(resp.content)} bytes")
-            return b64
-        
-        else:
-            print(f"Chart API small response: {len(resp.content)} bytes")
+               
+        except requests.exceptions.HTTPError as e:
+            if resp.status_code == 429:
+                continue
+            print(f"Chart API HTTP error: {e}")
             print(f"Response: {resp.text[:300]}")
             return None
-            
-    except requests.exceptions.HTTPError as e:
-        print(f"Chart API HTTP error: {e}")
-        print(f"Response: {resp.text[:300]}")
-        return None
-    except Exception as e:
-        print(f"Chart fetch error: {e}")
-        return None
-
-def get_image_mime(chart_url):
-    """Detect mime type from URL extension."""
-    url_lower = (chart_url or "").lower()
-    if ".jpg" in url_lower or ".jpeg" in url_lower:
-        return "image/jpeg"
-    if ".webp" in url_lower:
-        return "image/webp"
-    return "image/png"
+        except Exception as e:
+            print(f"Chart fetch error: {e}")
+            return None
+    
+    print("Chart API: failed after 3 retries (rate limited)")
+    return None
 # ==========================================
 # MCS ENGINE (FIXED)
 # ==========================================
