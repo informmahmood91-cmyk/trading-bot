@@ -49,12 +49,15 @@ ENABLE_WEB_SEARCH = os.environ.get("ENABLE_WEB_SEARCH", "true").lower() == "true
 CHART_IMG_API_KEY = os.environ.get("CHART_IMG_API_KEY")
 MAX_PAYLOAD_MB    = int(os.environ.get("MAX_PAYLOAD_MB", "10"))
 AI_RISK_PROFILE   = os.environ.get("AI_RISK_PROFILE", "BALANCED")
+GROQ_KEY          = os.environ.get("GROQ_KEY")
 
 # ==========================================
 # API ENDPOINTS
 # ==========================================
 GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL  = "llama-3.3-70b-versatile"
 
 # ==========================================
 # STATE — THREAD-SAFE
@@ -1485,7 +1488,50 @@ MARKET DATA:
                 time.sleep(3)
     return "GEMINI UNAVAILABLE: Server busy"
 
+# ==========================================
+# GROQ - ROUND 1 FALLBACK (when Gemini unavailable)
+# ==========================================
+def groq_analysis(signal, news, macro, chart_b64=None, chart_mime="image/png"):
+    if not GROQ_KEY:
+        return "GROQ UNAVAILABLE: No API key"
 
+    twelve   = signal.get("twelve_data", {})
+    calendar = signal.get("calendar", {})
+    context  = build_market_context(signal, news, macro, twelve, calendar)
+    rules    = get_round1_rules()
+
+    prompt_text = f"""You are an experienced institutional trader and market analyst.
+Your analysis is INDEPENDENT - you have not seen any other analyst's view.
+
+Analyse the H1 chart and all market data below.
+{rules}
+
+MARKET DATA:
+{context}
+
+{"Chart image is attached for analysis." if chart_b64 else "No chart image provided - rely on numerical data only."}"""
+
+    try:
+        r = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type":  "application/json"
+            },
+            json={
+                "model":       GROQ_MODEL,
+                "messages":    [{"role": "user", "content": prompt_text}],
+                "temperature": 0.3,
+                "max_tokens":  1400
+            },
+            timeout=30
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Groq analysis error: {e}")
+        return f"GROQ UNAVAILABLE: {str(e)}"
+        
 # ==========================================
 # CHATGPT - ROUND 1 (BLIND, WITH CHART VISION)
 # ==========================================
@@ -1532,7 +1578,6 @@ MARKET DATA:
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"CHATGPT ERROR: {str(e)}"
-
 
 # ==========================================
 # CHATGPT - DECIDES: AGREE / DEBATE / NEUTRAL (FIXED)
@@ -1766,7 +1811,61 @@ SUMMARY: [one sentence - your final defended stance]"""
                 time.sleep(3)
     return "GEMINI UNAVAILABLE: Could not defend"
 
+# ==========================================
+# GROQ - DEFEND (debate round fallback)
+# ==========================================
+def groq_defend(signal, news, macro, groq_first, challenge_msg,
+                chart_b64=None, chart_mime="image/png"):
+    if not GROQ_KEY:
+        return "GROQ UNAVAILABLE: No API key"
+    twelve  = signal.get("twelve_data", {})
+    context = build_market_context(signal, news, macro, twelve, signal.get("calendar", {}))
 
+    prompt_text = f"""You are defending your prior analysis of {signal.get('symbol','this pair')}.
+
+YOUR ORIGINAL VIEW:
+{groq_first}
+
+CHALLENGE FROM PEER:
+{challenge_msg}
+
+ORIGINAL DATA:
+{context}
+
+{"Chart image attached for reference." if chart_b64 else ""}
+
+Defend your position with specific data points or chart observations.
+If the challenge is valid, acknowledge it and explain why your conclusion still holds.
+Maximum 5 sentences.
+
+Respond in EXACTLY this format:
+DEFENDING DIRECTION: [BUY/SELL/NEUTRAL]
+KEY REASON 1: [strongest data/chart point supporting your view]
+KEY REASON 2: [second supporting argument]
+KEY REASON 3: [direct response to the challenge]
+SUMMARY: [one sentence - your final defended stance]"""
+
+    try:
+        r = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type":  "application/json"
+            },
+            json={
+                "model":       GROQ_MODEL,
+                "messages":    [{"role": "user", "content": prompt_text}],
+                "temperature": 0.3,
+                "max_tokens":  600
+            },
+            timeout=30
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Groq defend error: {e}")
+        return f"GROQ UNAVAILABLE: {str(e)}"
+        
 # ==========================================
 # CHATGPT - FINAL VERDICT (after debate)
 # ==========================================
@@ -1838,8 +1937,10 @@ WHY THIS DECISION: [2-3 sentences]"""
             "image_url": {"url": f"data:{chart_mime};base64,{chart_b64}", "detail": "high"}
         })
 
-    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH else []
-
+    VERDICT_MODEL = "gpt-4o-mini"
+    WEB_SEARCH_CAPABLE = {"gpt-4o", "gpt-4o-2024-05-13", "gpt-4o-2024-11-20", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"}
+    tools = [{"type": "web_search_preview"}] if ENABLE_WEB_SEARCH and VERDICT_MODEL in WEB_SEARCH_CAPABLE else []
+                              
     try:
         payload = {
             "model":    "gpt-4o-mini",
@@ -2111,13 +2212,12 @@ def process_signal_background(data):
             f"⏳ Fetching live data..."
         )
 
-                # GATE 2 — PARALLEL DATA FETCH
+        # GATE 2 — PARALLEL DATA FETCH
         news, macro, calendar = fetch_all_live_data(symbol)
 
         # GATE 2.5 — CURRENCY-SPECIFIC CALENDAR HARD BLOCK (3+ events)
         sc = clean_symbol(symbol)
         
-        # FIXED: Proper currency mapping for commodities, indices, and crypto
         COMMODITY_CURRENCY_MAP = {
             "XAUUSD": ["USD"],
             "GOLD": ["USD"],
@@ -2142,11 +2242,9 @@ def process_signal_background(data):
         elif len(sc) == 6:
             currencies = [sc[:3], sc[3:]]
         elif len(sc) == 7 and "/" in sc:
-            # Format like "XAU/USD" or "BTC/USD"
             parts = sc.split("/")
             currencies = [parts[0], parts[1]]
         else:
-            # Unknown format — use symbol itself as fallback
             currencies = [sc]
         
         events_raw = calendar.get("events", [])
@@ -2157,7 +2255,6 @@ def process_signal_background(data):
                 if event_currency in currencies:
                     rel_events.append(e.get("event", ""))
             elif isinstance(e, str):
-                # String events — check if any currency code appears in the event name
                 if any(curr in e.upper() for curr in currencies):
                     rel_events.append(e)
 
@@ -2176,7 +2273,7 @@ def process_signal_background(data):
         twelve_data = fetch_twelve_data(symbol)
         data["twelve_data"] = twelve_data
         data["calendar"]    = calendar
-        tq  = twelve_data.get("_quality","Unknown")
+        tq     = twelve_data.get("_quality","Unknown")
         adx_v  = safe_float(twelve_data.get("adx"))
         bb_w   = twelve_data.get("bb_width")
         regime = detect_market_regime(adx_v, bb_w)
@@ -2258,19 +2355,97 @@ def process_signal_background(data):
             send_telegram(f"❌ ChatGPT unavailable - cannot produce final decision. Skipped.")
             return
 
+        # GEMINI UNAVAILABLE — TRY GROQ FALLBACK
         if "GEMINI UNAVAILABLE" in gemini:
-            send_telegram(f"⚠️ Gemini unavailable - ChatGPT solo analysis.")
+            send_telegram(
+                f"⚠️ Gemini unavailable | {symbol}\n"
+                f"Attempting Groq fallback..."
+            )
+            groq = groq_analysis(data, news, macro, chart_b64, chart_mime)
+
+            if "GROQ UNAVAILABLE" not in groq:
+                groq_dir = extract_direction(groq)
+                print(f"Groq fallback: {groq_dir}")
+                send_telegram(
+                    f"🔄 GROQ FALLBACK | {symbol}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Groq:    {groq_dir}\n"
+                    f"ChatGPT: {chatgpt_dir}\n"
+                    f"ChatGPT reviewing both analyses..."
+                )
+
+                decision, decision_text = chatgpt_decides(
+                    symbol, price, data, groq, chatgpt, chart_b64, chart_mime
+                )
+                print(f"ChatGPT decision (Groq fallback): {decision}")
+
+                if decision == "AGREE_NEUTRAL":
+                    reason = extract_neutral_reason(groq, chatgpt, calendar, data)
+                    conf   = extract_confidence(decision_text)
+                    send_neutral(symbol, conf, reason, session, groq_dir, chatgpt_dir)
+                    send_neutral_audit(symbol, groq, chatgpt, reason)
+                    update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
+                    return
+
+                elif decision in ("AGREE_BUY", "AGREE_SELL"):
+                    final_dir = "BUY" if decision == "AGREE_BUY" else "SELL"
+                    send_telegram(
+                        f"✅ GROQ+CHATGPT AGREEMENT | {symbol}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Decision: {final_dir}\n"
+                        f"Groq: {groq_dir}  |  ChatGPT: {chatgpt_dir}\n"
+                        f"Producing execution parameters..."
+                    )
+                    _send_trade(symbol, price, data, twelve_data,
+                                groq_dir, chatgpt_dir, "AGREED", session,
+                                decision_text, calendar)
+                    return
+
+                else:
+                    send_telegram(
+                        f"⚔️ DEBATE | {symbol}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Groq: {groq_dir}  |  ChatGPT: {chatgpt_dir}\n"
+                        f"ChatGPT challenging Groq..."
+                    )
+
+                    challenge    = chatgpt_challenge(symbol, chatgpt, groq)
+                    groq_defense = groq_defend(data, news, macro, groq, challenge,
+                                               chart_b64, chart_mime)
+
+                    send_telegram(
+                        f"💬 DEBATE COMPLETE | {symbol}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Challenge and defense exchanged.\n"
+                        f"ChatGPT making final verdict..."
+                    )
+
+                    final_text = chatgpt_final_verdict(
+                        symbol, price, data, chatgpt, groq,
+                        challenge, groq_defense, chart_b64, chart_mime
+                    )
+                    _send_trade(symbol, price, data, twelve_data,
+                                groq_dir, chatgpt_dir, "DEBATE", session,
+                                final_text, calendar, post_debate=True)
+                    return
+
+            # Groq also unavailable — fall back to ChatGPT solo
+            send_telegram(
+                f"⚠️ Groq also unavailable | {symbol}\n"
+                f"ChatGPT solo analysis (80% confidence required)..."
+            )
             gemini_dir = "UNAVAILABLE"
-            if chatgpt_dir in ("BUY","SELL"):
+            solo_confidence = safe_int(extract_confidence(chatgpt).replace("%", ""))
+            if chatgpt_dir in ("BUY", "SELL") and solo_confidence >= 80:
                 _send_trade(symbol, price, data, twelve_data,
                             "UNAVAILABLE", chatgpt_dir, "SOLO", session,
                             chatgpt, calendar)
-            else:
-                reason = extract_neutral_reason(gemini, chatgpt, calendar, data)
-                conf   = extract_confidence(chatgpt)
-                send_neutral(symbol, conf, reason, session, "UNAVAILABLE", chatgpt_dir)
-                send_neutral_audit(symbol, "UNAVAILABLE", chatgpt, reason)
-                update_neutral_cache(symbol, session, "NEUTRAL", data, twelve_data)
+            elif chatgpt_dir in ("BUY", "SELL"):
+                send_telegram(
+                    f"⚪ SOLO BLOCKED | {symbol}\n"
+                    f"ChatGPT: {chatgpt_dir} | Confidence: {solo_confidence}%\n"
+                    f"Reason: Solo trades require 80%+ confidence. Both Gemini and Groq unavailable."
+                )
             return
 
         # GATE 5 - CHATGPT DECIDES
@@ -2334,7 +2509,6 @@ def process_signal_background(data):
                 challenge, gemini_reply, chart_b64, chart_mime
             )
 
-            # FIXED: No more "PENDING" - final_text contains the direction
             _send_trade(symbol, price, data, twelve_data,
                         gemini_dir, chatgpt_dir, "DEBATE", session,
                         final_text, calendar, post_debate=True)
@@ -2344,7 +2518,6 @@ def process_signal_background(data):
         err = f"ERROR: {str(e)[:200]}"
         print(err)
         send_telegram(f"❌ System Error | {err}")
-
 
 @app.route("/webhook", methods=["POST","GET"])
 def webhook():
