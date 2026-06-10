@@ -2166,13 +2166,9 @@ def process_signal_background(data):
         data["ny_fail_up"]    = safe_bool(data.get("ny_fail_up"))
         data["ny_fail_down"]  = safe_bool(data.get("ny_fail_down"))
 
-        # Chart image
         chart_url  = data.get("chart_url") or data.get("chart_image_url") or data.get("chart_screenshot")
-        chart_b64  = fetch_chart_image(chart_url) if chart_url else None
-        chart_mime = get_image_mime(chart_url) if chart_url else "image/png"
-        chart_info = "✅ Chart attached" if chart_b64 else "⚠️ No chart image"
 
-        print(f"{symbol} | {price} | {direction} | Score:{score} | EA:{signal_ea} | Chart:{chart_info}")
+        print(f"{symbol} | {price} | {direction} | Score:{score} | EA:{signal_ea}")
 
         # GATE 1 - SESSION & FREQUENCY
         allowed, gate_reason, session = session_gate(symbol)
@@ -2197,6 +2193,13 @@ def process_signal_background(data):
                 )
             return
 
+        # Chart image — fetched only after session gate passes
+        chart_b64  = fetch_chart_image(chart_url) if chart_url else None
+        chart_mime = get_image_mime(chart_url) if chart_url else "image/png"
+        chart_info = "✅ Chart attached" if chart_b64 else "⚠️ No chart image"
+
+        print(f"{symbol} | {price} | {direction} | Score:{score} | EA:{signal_ea} | Chart:{chart_info}")
+
         # Signal In
         send_telegram(
             f"📡 SIGNAL IN | {symbol} | {session.upper()}\n"
@@ -2211,7 +2214,7 @@ def process_signal_background(data):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⏳ Fetching live data..."
         )
-
+        
         # GATE 2 — PARALLEL DATA FETCH
         news, macro, calendar = fetch_all_live_data(symbol)
 
@@ -2672,40 +2675,38 @@ def root():
 # ==========================================
 # STARTUP (FIXED)
 # ==========================================
+print(f"Starting MIKA Trading Bot (All Bugs Fixed)")
+print(f"Risk Profile: {AI_RISK_PROFILE}")
+print(f"MCS Threshold: {MCS_THRESHOLD}%")
+print(f"Max Payload: {MAX_PAYLOAD_MB}MB")
+print(f"Min Confidence: {RISK_PROFILES[AI_RISK_PROFILE]['min_confidence_for_trade']}%")
+print(f"Triple Exhaust: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['triple_exhaust_enabled'] else 'OFF'}")
+print(f"Pivot Block: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['pivot_block_enabled'] else 'OFF'}")
+print(f"Session times: London 12:00-17:59 PKT | NewYork 18:00-01:59 PKT | Off 02:00-11:59 PKT")
+
+PKT = pytz.timezone("Asia/Karachi")
+scheduler = BackgroundScheduler(timezone=PKT)
+
+scheduler.add_job(send_presession_snapshot, "cron",
+                  hour=9, minute=0, args=["overnight"],
+                  id="overnight")
+
+scheduler.add_job(send_presession_snapshot, "cron",
+                  hour=11, minute=59, args=["presession"],
+                  id="presession")
+
+scheduler.add_job(reset_day, "cron",
+                  hour=0, minute=0,
+                  id="midnight_reset")
+
+scheduler.start()
+
+for job in scheduler.get_jobs():
+    print(f"SCHEDULED JOB: {job.id} | Next run: {job.next_run_time}")
+print(f"Current PKT time: {datetime.now(PKT)}")
+print(f"Current UTC time: {datetime.now(pytz.UTC)}")
+print("Scheduler started on Asia/Karachi timezone.")
+
 if __name__ == "__main__":
-    print(f"Starting MIKA Trading Bot (All Bugs Fixed)")
-    print(f"Risk Profile: {AI_RISK_PROFILE}")
-    print(f"MCS Threshold: {MCS_THRESHOLD}%")
-    print(f"Max Payload: {MAX_PAYLOAD_MB}MB")
-    print(f"Min Confidence: {RISK_PROFILES[AI_RISK_PROFILE]['min_confidence_for_trade']}%")
-    print(f"Triple Exhaust: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['triple_exhaust_enabled'] else 'OFF'}")
-    print(f"Pivot Block: {'ON' if RISK_PROFILES[AI_RISK_PROFILE]['pivot_block_enabled'] else 'OFF'}")
-    print(f"Session times: London 12:00-17:59 PKT | NewYork 18:00-01:59 PKT | Off 02:00-11:59 PKT")
-   
-    PKT = pytz.timezone("Asia/Karachi")
-    scheduler = BackgroundScheduler(timezone=PKT)
-
-    scheduler.add_job(send_presession_snapshot, "cron",
-                      hour=9, minute=0, args=["overnight"],
-                      id="overnight")
-
-    scheduler.add_job(send_presession_snapshot, "cron",
-                      hour=11, minute=59, args=["presession"],
-                      id="presession")
-
-    scheduler.add_job(reset_day, "cron",
-                      hour=0, minute=0,
-                      id="midnight_reset")
-   
-    scheduler.start()
-    
-    # DEBUG: Verify jobs are scheduled
-    from datetime import datetime
-    for job in scheduler.get_jobs():
-        print(f"SCHEDULED JOB: {job.id} | Next run: {job.next_run_time}")
-    print(f"Current PKT time: {datetime.now(PKT)}")
-    print(f"Current UTC time: {datetime.now(pytz.UTC)}")
-    print("Scheduler started on Asia/Karachi timezone.")
-   
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
