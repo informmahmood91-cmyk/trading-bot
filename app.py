@@ -2298,7 +2298,7 @@ def _send_trade(symbol, price, signal, twelve_data,
     except Exception as e:
         print(f"Gist save error: {e}")
 
-    return True               
+    return True              
 # ==========================================
 # MAIN WEBHOOK WITH BACKGROUND PROCESSING
 # ==========================================
