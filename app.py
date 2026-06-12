@@ -2290,7 +2290,7 @@ def _send_trade(symbol, price, signal, twelve_data,
             trades = {}
         trades[str(sid)] = trade_record
         gist_write("trades.json", trades)
-       print(f"Trade #{sid} saved to Gist — {clean_symbol(symbol)} {final_dir}")
+        print(f"Trade #{sid} saved to Gist — {clean_symbol(symbol)} {final_dir}")
 
         # Assign to current batch for this pair
         assign_trade_to_batch(sid, clean_symbol(symbol))
@@ -2298,8 +2298,7 @@ def _send_trade(symbol, price, signal, twelve_data,
     except Exception as e:
         print(f"Gist save error: {e}")
 
-    return True
-                    
+    return True               
 # ==========================================
 # MAIN WEBHOOK WITH BACKGROUND PROCESSING
 # ==========================================
