@@ -21,6 +21,7 @@ BUG FIXES APPLIED:
 17. Scheduler timezone fix using pytz
 """
 
+
 import json
 import os
 import re
