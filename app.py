@@ -50,6 +50,9 @@ CHART_IMG_API_KEY = os.environ.get("CHART_IMG_API_KEY")
 MAX_PAYLOAD_MB    = int(os.environ.get("MAX_PAYLOAD_MB", "10"))
 AI_RISK_PROFILE   = os.environ.get("AI_RISK_PROFILE", "BALANCED")
 GROQ_KEY          = os.environ.get("GROQ_KEY")
+GIST_ID           = os.environ.get("GIST_ID")
+GIST_TOKEN        = os.environ.get("GITHUB_GIST_TOKEN")
+FEEDBACK_TELEGRAM_TOKEN = os.environ.get("FEEDBACK_TELEGRAM_TOKEN")
 
 # ==========================================
 # API ENDPOINTS
@@ -111,7 +114,95 @@ RISK_PROFILES = {
     }
 }
 
+# ==========================================
+# GITHUB GIST STORAGE
+# ==========================================
+_gist_lock = threading.Lock()
 
+def gist_read(filename):
+    """Read a file from Gist. Returns dict, list, or string depending on file."""
+    if not GIST_ID or not GIST_TOKEN:
+        print(f"Gist not configured — skipping read of {filename}")
+        return {} if filename.endswith(".json") else ""
+    url     = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GIST_TOKEN}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"Gist read failed ({filename}): HTTP {resp.status_code}")
+            return {} if filename.endswith(".json") else ""
+        content = resp.json()["files"].get(filename, {}).get("content", "")
+        if not content or not content.strip():
+            return {} if filename.endswith(".json") else ""
+        if filename.endswith(".json"):
+            return json.loads(content)
+        return content.strip()
+    except Exception as e:
+        print(f"Gist read error ({filename}): {e}")
+        return {} if filename.endswith(".json") else ""
+
+def gist_write(filename, content):
+    """Write a file to Gist. Accepts dict, list, or string."""
+    if not GIST_ID or not GIST_TOKEN:
+        print(f"Gist not configured — skipping write of {filename}")
+        return
+    url     = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GIST_TOKEN}"}
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content, indent=2)
+    with _gist_lock:
+        try:
+            r = requests.patch(
+                url,
+                json={"files": {filename: {"content": content}}},
+                headers=headers,
+                timeout=10
+            )
+            if r.status_code not in (200, 201):
+                print(f"Gist write failed ({filename}): HTTP {r.status_code}")
+        except Exception as e:
+            print(f"Gist write error ({filename}): {e}")
+
+
+# ==========================================
+# SIGNAL COUNTER
+# ==========================================
+_signal_counter_lock = threading.Lock()
+_signal_counter      = 0
+
+def next_signal_id():
+    global _signal_counter
+    with _signal_counter_lock:
+        _signal_counter += 1
+        return _signal_counter
+
+
+# ==========================================
+# DYNAMIC ADVICE CACHE (reads Gist max once per hour)
+# ==========================================
+_advice_cache     = {}   # {"EURUSD": {"text": "...", "ts": 1234}}
+_advice_cache_ttl = 3600  # 60 minutes
+_advice_cache_lock = threading.Lock()
+
+def get_pair_advice(symbol):
+    """Return active advice for this pair, cached 60 min."""
+    sym = clean_symbol(symbol)
+    now = time.time()
+    with _advice_cache_lock:
+        cached = _advice_cache.get(sym)
+        if cached and (now - cached["ts"]) < _advice_cache_ttl:
+            return cached["text"]
+    all_advice = gist_read("pair_advice.json")
+    text = all_advice.get(sym, "") if isinstance(all_advice, dict) else ""
+    with _advice_cache_lock:
+        _advice_cache[sym] = {"text": text, "ts": now}
+    return text
+
+def invalidate_pair_advice_cache(symbol):
+    sym = clean_symbol(symbol)
+    with _advice_cache_lock:
+        _advice_cache.pop(sym, None)
+        
 # ==========================================
 # TELEGRAM — CHUNKED SENDER
 # ==========================================
@@ -143,7 +234,38 @@ def send_telegram(msg):
         except Exception as e:
             print(f"Telegram error: {e}")
 
-
+# ==========================================
+# FEEDBACK TELEGRAM SENDER
+# ==========================================
+def send_feedback_telegram(chat_id, msg):
+    """Send message via the separate Feedback Bot."""
+    if not FEEDBACK_TELEGRAM_TOKEN:
+        print("FEEDBACK_TELEGRAM_TOKEN not set")
+        return
+    if len(msg) <= 4000:
+        chunks = [msg]
+    else:
+        chunks = []
+        while len(msg) > 3900:
+            split_at = msg.rfind("\n", 0, 3900)
+            if split_at == -1:
+                split_at = 3900
+            chunks.append(msg[:split_at])
+            msg = msg[split_at:].lstrip("\n")
+        if msg:
+            chunks.append(msg)
+    for chunk in chunks:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{FEEDBACK_TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk},
+                timeout=10
+            )
+            if len(chunks) > 1:
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"Feedback Telegram error: {e}")
+            
 # ==========================================
 # UTILITIES
 # ==========================================
@@ -1267,7 +1389,7 @@ NEWS & MACRO:
 # ==========================================
 # DYNAMIC ROUND 1 RULES (Risk profile aware)
 # ==========================================
-def get_round1_rules():
+def get_round1_rules(symbol=""):
     """Generate analysis rules based on risk profile."""
     profile = RISK_PROFILES.get(AI_RISK_PROFILE, RISK_PROFILES["BALANCED"])
     
@@ -1410,6 +1532,16 @@ TECHNICAL VIEW: [2-3 sentences combining chart + data into your technical assess
 FUNDAMENTAL VIEW: [1-2 sentences - news sentiment, central bank stance, macro risk]
 REASON: [2-3 sentences - your complete final assessment combining all inputs]
 """
+    # Inject pair-specific dynamic advice if available
+    if symbol:
+        pair_advice = get_pair_advice(symbol)
+        if pair_advice and pair_advice.strip():
+            rules += f"""
+
+━━━ PAIR-SPECIFIC ADVICE FOR {clean_symbol(symbol)} (learned from real outcomes) ━━━
+{pair_advice.strip()}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
     return rules
 
 
@@ -1446,7 +1578,7 @@ def gemini_analysis(signal, news, macro, chart_b64=None, chart_mime="image/png")
     twelve   = signal.get("twelve_data", {})
     calendar = signal.get("calendar", {})
     context  = build_market_context(signal, news, macro, twelve, calendar)
-    rules    = get_round1_rules()
+    rules    = get_round1_rules(symbol=signal.get("symbol",""))
 
     prompt_text = f"""You are an experienced institutional trader and market analyst.
 Your analysis is INDEPENDENT - you have not seen any other analyst's view.
@@ -1498,7 +1630,7 @@ def groq_analysis(signal, news, macro, chart_b64=None, chart_mime="image/png"):
     twelve   = signal.get("twelve_data", {})
     calendar = signal.get("calendar", {})
     context  = build_market_context(signal, news, macro, twelve, calendar)
-    rules    = get_round1_rules()
+    rules    = get_round1_rules(symbol=signal.get("symbol",""))
 
     prompt_text = f"""You are an experienced institutional trader and market analyst.
 Your analysis is INDEPENDENT - you have not seen any other analyst's view.
@@ -1542,7 +1674,7 @@ def chatgpt_analysis(symbol, price, signal, news, macro, calendar,
 
     twelve  = signal.get("twelve_data", {})
     context = build_market_context(signal, news, macro, twelve, calendar)
-    rules   = get_round1_rules()
+    rules   = get_round1_rules(symbol=symbol)
 
     prompt_text = f"""You are an experienced institutional trader and market analyst.
 Your analysis is INDEPENDENT - you have not seen any other analyst's view.
@@ -1988,7 +2120,8 @@ def fmt_dir(d):
 def build_final_telegram(symbol, price, direction, sl, tp, rr, confidence,
                          tech_view, fund_view, reason,
                          chart_txt, checklist,
-                         gemini_dir, chatgpt_dir, path, session, regime=None):
+                         gemini_dir, chatgpt_dir, path, session, regime=None,
+                         signal_id=None):
     path_tag  = {"AGREED":"✅ Both Agreed","DEBATE":"⚔️ After Debate","SOLO":"🤖 ChatGPT Only"}.get(path, path)
     dir_line  = fmt_dir(direction)
     su        = session.upper()
@@ -2018,6 +2151,7 @@ def build_final_telegram(symbol, price, direction, sl, tp, rr, confidence,
         f"🎯 REASON:\n{reason}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Price: {price} | H1 | {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        + (f"\n🔢 Trade ID: #{signal_id:03d}" if signal_id else "")
     )
 
 def send_neutral(symbol, confidence, reason, session, gemini_dir, chatgpt_dir):
@@ -2049,9 +2183,9 @@ def send_neutral_audit(symbol, gemini_text, chatgpt_text, reason, post_debate=Fa
 # ==========================================
 def _send_trade(symbol, price, signal, twelve_data,
                 gemini_dir, chatgpt_dir, path, session,
-                decision_text, calendar, post_debate=False):
+                decision_text, calendar, post_debate=False, chart_b64=None):
     """
-    FIXED: Removed direction parameter. Direction is always extracted
+    FIXED: Removed direction parameter. Direction always extracted
     from decision_text via extract_direction().
     """
     final_dir = extract_direction(decision_text)
@@ -2060,15 +2194,13 @@ def _send_trade(symbol, price, signal, twelve_data,
         reason = extract_neutral_reason(decision_text, "", calendar, signal)
         conf   = extract_confidence(decision_text)
         send_neutral(symbol, conf, reason, session, gemini_dir, chatgpt_dir)
-        send_neutral_audit(symbol, gemini_dir, decision_text, reason, post_debate=post_debate)
+        send_neutral_audit(symbol, gemini_dir, decision_text, reason,
+                           post_debate=post_debate)
         update_neutral_cache(symbol, session, "NEUTRAL", signal, twelve_data)
         return False
 
-    atr_td  = safe_float(twelve_data.get("atr"))
-    atr_ps  = safe_float(signal.get("atr"))
-    # FIXED: Prefer webhook ATR when Twelve Data ATR is suspiciously small.
-    # Twelve Data sometimes returns tiny ATR for commodities (e.g. 0.5 for Gold
-    # when real ATR is 5+). If Twelve Data ATR < 20% of webhook ATR, use webhook.
+    atr_td = safe_float(twelve_data.get("atr"))
+    atr_ps = safe_float(signal.get("atr"))
     if atr_td is not None and atr_ps is not None and atr_ps > 0:
         if atr_td < atr_ps * 0.2:
             atr_use = atr_ps
@@ -2081,6 +2213,7 @@ def _send_trade(symbol, price, signal, twelve_data,
         atr_use = atr_td
     else:
         atr_use = None
+
     sl, tp, rr = calculate_sl_tp(final_dir, price, atr_use)
 
     valid, v_msg = validate_levels(final_dir, price, sl, tp)
@@ -2104,18 +2237,67 @@ def _send_trade(symbol, price, signal, twelve_data,
         chart_txt = extract_multiline_field(decision_text, "CHART CONFIRMS")
     checklist = extract_multiline_field(decision_text, "CHECKLIST")
 
-    adx_v   = safe_float(twelve_data.get("adx"))
-    bb_w    = twelve_data.get("bb_width")
-    regime  = detect_market_regime(adx_v, bb_w)
+    adx_v  = safe_float(twelve_data.get("adx"))
+    bb_w   = twelve_data.get("bb_width")
+    regime = detect_market_regime(adx_v, bb_w)
+
+    sid = next_signal_id()
 
     msg = build_final_telegram(
         symbol, price, final_dir, sl, tp, rr, conf,
         tech, fund, reason, chart_txt, checklist,
-        gemini_dir, chatgpt_dir, path, session, regime
+        gemini_dir, chatgpt_dir, path, session, regime,
+        signal_id=sid
     )
     send_telegram(msg)
     register_trade(symbol, session)
     update_neutral_cache(symbol, session, final_dir, signal, twelve_data)
+
+    # Save trade record to Gist
+    try:
+        trade_record = {
+            "signal_id":        sid,
+            "symbol":           clean_symbol(symbol),
+            "session":          session,
+            "direction":        final_dir,
+            "entry":            price,
+            "sl":               sl,
+            "tp":               tp,
+            "rr":               rr,
+            "confidence":       conf,
+            "chart_available":  chart_b64 is not None,
+            "gemini_result":    gemini_dir,
+            "chatgpt_result":   chatgpt_dir,
+            "decision_path":    path,
+            "regime":           regime,
+            "technical_view":   tech,
+            "fundamental_view": fund,
+            "reason":           reason,
+            "atr":              str(atr_use),
+            "score":            safe_str(signal.get("score")),
+            "ea_score":         safe_str(signal.get("ea_score")),
+            "adx":              safe_str(signal.get("adx")),
+            "structure":        safe_str(signal.get("structure_bias")),
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "status":           "PENDING",
+            "outcome":          None,
+            "outcome_note":     None,
+            "outcome_timestamp": None,
+            "batch_number":     None
+        }
+        trades = gist_read("trades.json")
+        if not isinstance(trades, dict):
+            trades = {}
+        trades[str(sid)] = trade_record
+        gist_write("trades.json", trades)
+       print(f"Trade #{sid} saved to Gist — {clean_symbol(symbol)} {final_dir}")
+
+        # Assign to current batch for this pair
+        assign_trade_to_batch(sid, clean_symbol(symbol))
+
+    except Exception as e:
+        print(f"Gist save error: {e}")
+
     return True
                     
 # ==========================================
@@ -2401,7 +2583,7 @@ def process_signal_background(data):
                     )
                     _send_trade(symbol, price, data, twelve_data,
                                 groq_dir, chatgpt_dir, "AGREED", session,
-                                decision_text, calendar)
+                                decision_text, calendar, chart_b64=chart_b64)
                     return
 
                 else:
@@ -2429,7 +2611,8 @@ def process_signal_background(data):
                     )
                     _send_trade(symbol, price, data, twelve_data,
                                 groq_dir, chatgpt_dir, "DEBATE", session,
-                                final_text, calendar, post_debate=True)
+                                final_text, calendar, post_debate=True,
+                                chart_b64=chart_b64)
                     return
 
             # Groq also unavailable — fall back to ChatGPT solo
@@ -2442,7 +2625,7 @@ def process_signal_background(data):
             if chatgpt_dir in ("BUY", "SELL") and solo_confidence >= 80:
                 _send_trade(symbol, price, data, twelve_data,
                             "UNAVAILABLE", chatgpt_dir, "SOLO", session,
-                            chatgpt, calendar)
+                            chatgpt, calendar, chart_b64=chart_b64)
             elif chatgpt_dir in ("BUY", "SELL"):
                 send_telegram(
                     f"⚪ SOLO BLOCKED | {symbol}\n"
@@ -2484,7 +2667,7 @@ def process_signal_background(data):
             )
             _send_trade(symbol, price, data, twelve_data,
                         gemini_dir, chatgpt_dir, "AGREED", session,
-                        decision_text, calendar)
+                        decision_text, calendar, chart_b64=chart_b64)
             return
 
         else:
@@ -2514,13 +2697,553 @@ def process_signal_background(data):
 
             _send_trade(symbol, price, data, twelve_data,
                         gemini_dir, chatgpt_dir, "DEBATE", session,
-                        final_text, calendar, post_debate=True)
+                        final_text, calendar, post_debate=True,
+                        chart_b64=chart_b64)
             return
 
     except Exception as e:
         err = f"ERROR: {str(e)[:200]}"
         print(err)
         send_telegram(f"❌ System Error | {err}")
+
+# ==========================================
+# PAIR BATCH ENGINE
+# ==========================================
+BATCH_SIZE = 10  # completed outcomes needed per batch
+
+def get_pair_state(pair_state, symbol):
+    """Get or initialise state for a pair."""
+    if symbol not in pair_state:
+        pair_state[symbol] = {
+            "current_batch":     1,
+            "completed_in_batch": 0,
+            "total_completed":   0,
+            "total_not_taken":   0,
+            "batches":           {}
+        }
+    return pair_state[symbol]
+
+def check_and_close_batch(symbol, chat_id=None):
+    """
+    Check if batch is complete for a pair.
+    If yes — mark remaining PENDING as NOT_TAKEN, freeze batch, trigger Groq review.
+    """
+    trades     = gist_read("trades.json")
+    pair_state = gist_read("pair_state.json")
+    if not isinstance(pair_state, dict):
+        pair_state = {}
+    if not isinstance(trades, dict):
+        trades = {}
+
+    ps  = get_pair_state(pair_state, symbol)
+    batch_num = ps["current_batch"]
+
+    # Gather trades for this pair in current batch
+    batch_trades = [
+        t for t in trades.values()
+        if t.get("symbol") == symbol
+        and t.get("batch_number") == batch_num
+    ]
+
+    completed = [t for t in batch_trades if t.get("status") == "COMPLETED"]
+
+    if len(completed) < BATCH_SIZE:
+        return  # batch not ready
+
+    # Batch complete — mark remaining PENDING as NOT_TAKEN
+    updated = False
+    for tid, t in trades.items():
+        if (t.get("symbol") == symbol
+                and t.get("batch_number") == batch_num
+                and t.get("status") == "PENDING"):
+            trades[tid]["status"]  = "NOT_TAKEN"
+            trades[tid]["outcome"] = "NOT_TAKEN"
+            ps["total_not_taken"] += 1
+            updated = True
+
+    # Freeze batch snapshot
+    ps["batches"][str(batch_num)] = {
+        "completed": len(completed),
+        "not_taken": ps["total_not_taken"],
+        "closed_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # Advance to next batch
+    ps["current_batch"]      += 1
+    ps["completed_in_batch"]  = 0
+
+    if updated:
+        gist_write("trades.json", trades)
+    gist_write("pair_state.json", pair_state)
+
+    print(f"Batch {batch_num} closed for {symbol} — triggering Groq review")
+
+    # Trigger Groq review in background
+    thread = threading.Thread(
+        target=run_pair_review,
+        args=(symbol, completed, batch_num, chat_id)
+    )
+    thread.daemon = True
+    thread.start()
+
+
+def assign_trade_to_batch(signal_id, symbol):
+    """Assign a new trade to the current open batch for its pair."""
+    try:
+        pair_state = gist_read("pair_state.json")
+        trades     = gist_read("trades.json")
+        if not isinstance(pair_state, dict):
+            pair_state = {}
+        if not isinstance(trades, dict):
+            trades = {}
+
+        ps        = get_pair_state(pair_state, symbol)
+        batch_num = ps["current_batch"]
+
+        sid = str(signal_id)
+        if sid in trades:
+            trades[sid]["batch_number"] = batch_num
+            gist_write("trades.json", trades)
+            gist_write("pair_state.json", pair_state)
+    except Exception as e:
+        print(f"Batch assign error: {e}")
+
+
+# ==========================================
+# GROQ PAIR REVIEW
+# ==========================================
+def run_pair_review(symbol, completed_trades, batch_num, chat_id=None):
+    """Run Groq analysis on 10 completed trades for a specific pair."""
+    if not GROQ_KEY:
+        if chat_id:
+            send_feedback_telegram(chat_id, f"❌ GROQ_KEY not set — cannot review {symbol}.")
+        return
+
+    # Build trade summary
+    trade_text = ""
+    wins   = 0
+    losses = 0
+    for i, t in enumerate(completed_trades):
+        outcome = t.get("outcome", "unknown").upper()
+        if outcome == "WIN":
+            wins += 1
+        elif outcome == "LOSS":
+            losses += 1
+        note = t.get("outcome_note", "") or ""
+        trade_text += (
+            f"TRADE {i+1} (#{t.get('signal_id','?')}):\n"
+            f"  Direction:  {t.get('direction','N/A')} | Session: {t.get('session','N/A')}\n"
+            f"  Confidence: {t.get('confidence','N/A')} | Chart: {'Yes' if t.get('chart_available') else 'No'}\n"
+            f"  Decision:   {t.get('decision_path','N/A')} | Regime: {t.get('regime','N/A')}\n"
+            f"  Score:      {t.get('score','N/A')} | EA: {t.get('ea_score','N/A')} | ADX: {t.get('adx','N/A')}\n"
+            f"  Structure:  {t.get('structure','N/A')}\n"
+            f"  Technical:  {str(t.get('technical_view','N/A'))[:200]}\n"
+            f"  Reason:     {str(t.get('reason','N/A'))[:200]}\n"
+            f"  Outcome:    {outcome}"
+            + (f" — {note}" if note else "") + "\n\n"
+        )
+
+    # Get last 3 approved advice for anti-repetition
+    history     = gist_read("advice_history.json")
+    if not isinstance(history, dict):
+        history = {}
+    past_advice = history.get(symbol, [])[-3:]
+    past_text   = ""
+    if past_advice:
+        past_text = "PREVIOUS ADVICE (do NOT repeat similar logic):\n"
+        for i, a in enumerate(past_advice):
+            past_text += f"Version {i+1}:\n{a.get('advice','')}\n\n"
+
+    prompt = f"""You are a trading performance analyst reviewing {BATCH_SIZE} completed trades for {symbol}.
+
+{past_text}
+TRADE RESULTS FOR {symbol} — BATCH {batch_num}:
+{trade_text}
+Summary: {wins} wins, {losses} losses.
+
+Analyze these trades carefully. Identify:
+- What conditions led to wins for {symbol} specifically
+- What conditions led to losses for {symbol} specifically  
+- Patterns in session, regime, confidence, chart availability, decision path
+- Any specific filters or rules that would have improved results
+
+Generate pair-specific advice ONLY for {symbol}.
+This advice will be injected into future AI analysis for {symbol} signals only.
+Keep it concise — maximum 6 bullet points.
+Each bullet must be specific and actionable (not generic).
+Must be materially different from previous advice shown above.
+
+Respond in EXACTLY this format:
+ADVICE FOR {symbol}:
+- bullet 1
+- bullet 2
+- bullet 3"""
+
+    try:
+        r = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":       GROQ_MODEL,
+                "messages":    [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens":  600
+            },
+            timeout=30
+        )
+        r.raise_for_status()
+        raw    = r.json()["choices"][0]["message"]["content"]
+        advice = raw.split(f"ADVICE FOR {symbol}:")[-1].strip()
+    except Exception as e:
+        if chat_id:
+            send_feedback_telegram(chat_id, f"❌ Groq review failed for {symbol}: {e}")
+        return
+
+    # Save to pending
+    pending = gist_read("pending_advice.json")
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[symbol] = {
+        "advice":     advice,
+        "batch_num":  batch_num,
+        "wins":       wins,
+        "losses":     losses,
+        "timestamp":  datetime.now(timezone.utc).isoformat()
+    }
+    gist_write("pending_advice.json", pending)
+
+    if chat_id:
+        send_feedback_telegram(
+            chat_id,
+            f"📊 BATCH {batch_num} REVIEW — {symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Results: {wins}W / {losses}L\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{advice}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Reply: {symbol}: YES  to activate\n"
+            f"Reply: {symbol}: NO   to discard"
+        )
+    else:
+        send_telegram(
+            f"📊 BATCH {batch_num} REVIEW — {symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Results: {wins}W / {losses}L\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{advice}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Reply via Feedback Bot:\n"
+            f"{symbol}: YES  or  {symbol}: NO"
+        )
+
+
+# ==========================================
+# DAILY REPORT (fires at 11:59 PM PKT)
+# ==========================================
+def send_daily_report():
+    """Build and send structured daily performance report."""
+    try:
+        trades     = gist_read("trades.json")
+        pair_state = gist_read("pair_state.json")
+        if not isinstance(trades, dict):
+            trades = {}
+        if not isinstance(pair_state, dict):
+            pair_state = {}
+
+        today_pkt = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+
+        # Filter today's trades
+        today_trades = {
+            tid: t for tid, t in trades.items()
+            if t.get("timestamp","")[:10] == str(today_pkt)
+        }
+
+        total_generated = len(today_trades)
+        total_completed = sum(1 for t in today_trades.values() if t.get("status") == "COMPLETED")
+        total_pending   = sum(1 for t in today_trades.values() if t.get("status") == "PENDING")
+        total_not_taken = sum(1 for t in today_trades.values() if t.get("status") == "NOT_TAKEN")
+
+        # Per pair breakdown
+        pairs = {}
+        for t in today_trades.values():
+            sym = t.get("symbol", "UNKNOWN")
+            if sym not in pairs:
+                pairs[sym] = {"generated": 0, "completed": 0, "pending": 0}
+            pairs[sym]["generated"] += 1
+            if t.get("status") == "COMPLETED":
+                pairs[sym]["completed"] += 1
+            elif t.get("status") == "PENDING":
+                pairs[sym]["pending"] += 1
+
+        pair_lines = ""
+        for sym, counts in sorted(pairs.items()):
+            ps          = pair_state.get(sym, {})
+            batch_num   = ps.get("current_batch", 1)
+            comp_batch  = ps.get("completed_in_batch", 0)
+            needed      = BATCH_SIZE - comp_batch
+            batch_ready = comp_batch >= BATCH_SIZE
+
+            status_line = (
+                "✅ Batch ready for analysis"
+                if batch_ready
+                else f"📈 {comp_batch}/{BATCH_SIZE} toward next batch ({needed} more needed)"
+            )
+            pair_lines += (
+                f"\n{sym}:\n"
+                f"  Generated: {counts['generated']} | "
+                f"Completed: {counts['completed']} | "
+                f"Pending: {counts['pending']}\n"
+                f"  {status_line}\n"
+            )
+
+        # Overall batch status
+        total_all_completed = sum(
+            ps.get("total_completed", 0)
+            for ps in pair_state.values()
+        )
+        any_batch_ready = any(
+            ps.get("completed_in_batch", 0) >= BATCH_SIZE
+            for ps in pair_state.values()
+        )
+        system_status = (
+            "✅ One or more pairs ready for batch analysis"
+            if any_batch_ready
+            else f"⏳ Collecting outcomes — {total_all_completed} total completed across all pairs"
+        )
+
+        report = (
+            f"📋 DAILY REPORT | {today_pkt} PKT\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Trades Today:   {total_generated}\n"
+            f"Completed:      {total_completed}\n"
+            f"Pending:        {total_pending}\n"
+            f"Not Taken:      {total_not_taken}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"PER PAIR:\n"
+            f"{pair_lines}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"SYSTEM STATUS:\n"
+            f"{system_status}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        send_telegram(report)
+        print("Daily report sent")
+
+    except Exception as e:
+        print(f"Daily report error: {e}")
+        send_telegram(f"❌ Daily report failed: {e}")
+
+
+# ==========================================
+# FEEDBACK WEBHOOK
+# ==========================================
+@app.route("/telegram-feedback", methods=["POST"])
+def telegram_feedback_webhook():
+    try:
+        data = request.get_json()
+        if not data or "message" not in data:
+            return "OK"
+
+        chat_id = data["message"]["chat"]["id"]
+        text    = data["message"].get("text", "").strip()
+
+        # --- PAIR: YES / NO for pending advice ---
+        # Format: EURUSD: YES  or  GOLD: NO
+        approval_match = re.match(
+            r"([A-Z]{3,6})\s*:\s*(YES|NO)",
+            text.upper().strip()
+        )
+        if approval_match:
+            symbol  = approval_match.group(1)
+            verdict = approval_match.group(2)
+
+            pending = gist_read("pending_advice.json")
+            if not isinstance(pending, dict):
+                pending = {}
+
+            if symbol not in pending:
+                send_feedback_telegram(
+                    chat_id,
+                    f"⚠️ No pending advice found for {symbol}."
+                )
+                return "OK"
+
+            entry = pending[symbol]
+
+            if verdict == "YES":
+                # Save to pair_advice.json
+                all_advice = gist_read("pair_advice.json")
+                if not isinstance(all_advice, dict):
+                    all_advice = {}
+                all_advice[symbol] = entry["advice"]
+                gist_write("pair_advice.json", all_advice)
+
+                # Save to advice_history.json
+                history = gist_read("advice_history.json")
+                if not isinstance(history, dict):
+                    history = {}
+                if symbol not in history:
+                    history[symbol] = []
+                history[symbol].append({
+                    "advice":    entry["advice"],
+                    "batch_num": entry.get("batch_num"),
+                    "wins":      entry.get("wins"),
+                    "losses":    entry.get("losses"),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                # Keep only last 3
+                history[symbol] = history[symbol][-3:]
+                gist_write("advice_history.json", history)
+
+                # Remove from pending
+                del pending[symbol]
+                gist_write("pending_advice.json", pending)
+
+                # Invalidate cache
+                invalidate_pair_advice_cache(symbol)
+
+                send_feedback_telegram(
+                    chat_id,
+                    f"✅ {symbol} advice approved and active.\n"
+                    f"All future {symbol} signals will use this advice."
+                )
+
+            else:  # NO
+                del pending[symbol]
+                gist_write("pending_advice.json", pending)
+                send_feedback_telegram(
+                    chat_id,
+                    f"🗑️ {symbol} advice discarded.\n"
+                    f"No advice active for {symbol} until next batch."
+                )
+
+            return "OK"
+
+        # --- Trade outcome feedback ---
+        # Format: 5 win note here   or   5 loss SL hit reversed
+        outcome_match = re.match(
+            r"(\d+)\s+(win|loss)(.*)?",
+            text.strip(),
+            re.IGNORECASE
+        )
+        if outcome_match:
+            signal_id   = outcome_match.group(1)
+            outcome     = outcome_match.group(2).lower()
+            note        = outcome_match.group(3).strip() if outcome_match.group(3) else ""
+
+            trades = gist_read("trades.json")
+            if not isinstance(trades, dict):
+                trades = {}
+
+            if signal_id not in trades:
+                send_feedback_telegram(
+                    chat_id,
+                    f"⚠️ Trade #{signal_id} not found.\n"
+                    f"Check the Trade ID and try again."
+                )
+                return "OK"
+
+            trade  = trades[signal_id]
+            symbol = trade.get("symbol", "UNKNOWN")
+
+            # Check trade is still PENDING
+            if trade.get("status") != "PENDING":
+                send_feedback_telegram(
+                    chat_id,
+                    f"⚠️ Trade #{signal_id} is already {trade.get('status')}.\n"
+                    f"Cannot update after batch closure."
+                )
+                return "OK"
+
+            # Update trade
+            trades[signal_id]["status"]            = "COMPLETED"
+            trades[signal_id]["outcome"]           = outcome
+            trades[signal_id]["outcome_note"]      = note if note else None
+            trades[signal_id]["outcome_timestamp"] = datetime.now(timezone.utc).isoformat()
+            gist_write("trades.json", trades)
+
+            # Update pair_state completed count
+            pair_state = gist_read("pair_state.json")
+            if not isinstance(pair_state, dict):
+                pair_state = {}
+            ps = get_pair_state(pair_state, symbol)
+            ps["completed_in_batch"] += 1
+            ps["total_completed"]    += 1
+            gist_write("pair_state.json", pair_state)
+
+            send_feedback_telegram(
+                chat_id,
+                f"✅ Trade #{signal_id} ({symbol}) recorded as {outcome.upper()}."
+                + (f"\nNote: {note}" if note else "") +
+                f"\n\nCompleted for {symbol}: "
+                f"{ps['completed_in_batch']}/{BATCH_SIZE} in current batch."
+            )
+
+            # Check if batch complete
+            check_and_close_batch(symbol, chat_id)
+            return "OK"
+
+        # --- Status command ---
+        if text.strip().upper() == "/STATUS":
+            trades     = gist_read("trades.json")
+            pair_state = gist_read("pair_state.json")
+            pending    = gist_read("pending_advice.json")
+            if not isinstance(trades, dict):
+                trades = {}
+            if not isinstance(pair_state, dict):
+                pair_state = {}
+            if not isinstance(pending, dict):
+                pending = {}
+
+            pending_trades = {
+                tid: t for tid, t in trades.items()
+                if t.get("status") == "PENDING"
+            }
+            pending_by_pair = {}
+            for t in pending_trades.values():
+                sym = t.get("symbol", "?")
+                pending_by_pair[sym] = pending_by_pair.get(sym, 0) + 1
+
+            status_lines = ""
+            for sym, count in sorted(pending_by_pair.items()):
+                ps   = pair_state.get(sym, {})
+                comp = ps.get("completed_in_batch", 0)
+                status_lines += f"  {sym}: {comp}/{BATCH_SIZE} completed | {count} pending outcome\n"
+
+            pending_advice_list = ", ".join(pending.keys()) if pending else "None"
+
+            send_feedback_telegram(
+                chat_id,
+                f"📊 SYSTEM STATUS\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Total trades: {len(trades)}\n"
+                f"Pending outcomes: {len(pending_trades)}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Per pair progress:\n{status_lines}"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Pending advice approval: {pending_advice_list}"
+            )
+            return "OK"
+
+        # --- Unknown input — show help ---
+        send_feedback_telegram(
+            chat_id,
+            "📋 MIKA Feedback Bot\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Record outcome:\n"
+            "  5 win\n"
+            "  5 loss SL hit then reversed\n\n"
+            "Approve advice:\n"
+            "  EURUSD: YES\n"
+            "  GOLD: NO\n\n"
+            "Check status:\n"
+            "  /status"
+        )
+        return "OK"
+
+    except Exception as e:
+        print(f"Feedback webhook error: {e}")
+        return "OK"
 
 @app.route("/webhook", methods=["POST","GET"])
 def webhook():
@@ -2698,6 +3421,10 @@ scheduler.add_job(send_presession_snapshot, "cron",
 scheduler.add_job(reset_day, "cron",
                   hour=0, minute=0,
                   id="midnight_reset")
+
+scheduler.add_job(send_daily_report, "cron",
+                  hour=23, minute=59,
+                  id="daily_report")
 
 scheduler.start()
 
